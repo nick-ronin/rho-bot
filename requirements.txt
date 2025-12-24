@@ -4,4 +4,4 @@ asyncio
 aiohttp
 psycopg2-binary
 SQLAlchemy
-asyncpg==0.27.1
+asyncpg
