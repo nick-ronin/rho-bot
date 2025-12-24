@@ -2,22 +2,24 @@ import asyncio
 import tempfile
 import json
 from aiogram import Bot, Dispatcher, types, F
-import ollama
 from ollama import chat
 import asyncpg
 import os
 from collections import deque
 
 # === НАСТРОЙКИ ===
-API_TOKEN = os.environ["BOT_TOKEN"]
+API_TOKEN = os.environ.get("BOT_TOKEN")
 MODEL = "gemma3:27b-cloud"
 CONTEXT_LIMIT = 1000
-DATABASE_URL = os.environ["DATABASE_URL"]
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # === БАЗА ===
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 db_pool = None
+
+async def get_conn():
+    return await asyncpg.connect(DATABASE_URL)
 
 # === Идентификация пользователей ===
 NICK_ID = 823849772
