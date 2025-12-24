@@ -2,7 +2,7 @@ import asyncio
 import tempfile
 import json
 from aiogram import Bot, Dispatcher, types, F
-from ollama import chat
+from ollama import Ollama
 import asyncpg
 import os
 from collections import deque
@@ -12,14 +12,21 @@ API_TOKEN = os.environ.get("BOT_TOKEN")
 MODEL = "gemma3:27b-cloud"
 CONTEXT_LIMIT = 1000
 DATABASE_URL = os.environ.get("DATABASE_URL")
+OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "https://api.ollama.com")
 
-# === БАЗА ===
+if not API_TOKEN:
+    raise RuntimeError("Telegram BOT_TOKEN not set in environment variables")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL not set in environment variables")
+if not OLLAMA_API_KEY:
+    raise RuntimeError("OLLAMA_API_KEY not set in environment variables")
+
+# === БАЗА и Бот ===
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 db_pool = None
-
-async def get_conn():
-    return await asyncpg.connect(DATABASE_URL)
+ollama_client = Ollama(api_key=OLLAMA_API_KEY, base_url=OLLAMA_HOST)
 
 # === Идентификация пользователей ===
 NICK_ID = 823849772
@@ -76,17 +83,12 @@ async def get_context(chat_id, user_id, context_type):
         )
         if row:
             context = deque(json.loads(row["messages"]), maxlen=CONTEXT_LIMIT)
-            if len(context) > CONTEXT_LIMIT:
-                context = deque(list(context)[-CONTEXT_LIMIT:], maxlen=CONTEXT_LIMIT)
             return context
-        else:
-            return deque(maxlen=CONTEXT_LIMIT)
+        return deque(maxlen=CONTEXT_LIMIT)
 
 async def save_context(chat_id, user_id, context_type, context):
-    # обрезаем, если больше лимита
     if len(context) > CONTEXT_LIMIT:
         context = deque(list(context)[-CONTEXT_LIMIT:], maxlen=CONTEXT_LIMIT)
-
     async with db_pool.acquire() as conn:
         data = json.dumps(list(context))
         await conn.execute("""
@@ -98,28 +100,25 @@ async def save_context(chat_id, user_id, context_type, context):
 
 # === Функции общения с Ollama ===
 async def ask_ollama_stream(user_id, chat_id, prompt):
-    # Персональный контекст
     personal = await get_context(chat_id, user_id, "personal")
-    # Общий контекст группы, используем user_id=0 как "групповой"
     group = await get_context(chat_id, 0, "group")
     system_prompt = get_system_prompt(user_id)
 
-    personal.append({"role": "user", "messages": prompt})
-    group.append({"role": "user", "user_id": user_id, "messages": prompt})
+    personal.append({"role": "user", "content": prompt})
+    group.append({"role": "user", "user_id": user_id, "content": prompt})
 
-    messages = [{"role": "system", "messages": system_prompt}] + list(group) + list(personal)
+    messages = [{"role": "system", "content": system_prompt}] + list(group) + list(personal)
 
     reply_text = ""
-    response = chat(MODEL, messages=messages, stream=True)
+    response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
     for chunk in response:
-        delta = getattr(chunk.message, "messages", "")
+        delta = getattr(chunk.message, "content", "")
         if delta:
             reply_text += delta
 
-    personal.append({"role": "assistant", "messages": reply_text.strip()})
-    group.append({"role": "assistant", "user_id": user_id, "messages": reply_text.strip()})
+    personal.append({"role": "assistant", "content": reply_text.strip()})
+    group.append({"role": "assistant", "user_id": user_id, "content": reply_text.strip()})
 
-    # Сохраняем оба контекста
     await save_context(chat_id, user_id, "personal", personal)
     await save_context(chat_id, 0, "group", group)
 
@@ -156,11 +155,7 @@ async def handle_photo(message: types.Message):
     try:
         await bot.download(photo, destination=tmp_path)
         prompt = message.caption or "Опиши изображение кратко и по делу."
-        try:
-            full_text = await ask_ollama_stream(user_id, chat_id, prompt)
-        except Exception:
-            await message.reply("Модель ослепла. Попробуй ещё раз.")
-            return
+        full_text = await ask_ollama_stream(user_id, chat_id, prompt)
         await message.reply(full_text)
     finally:
         try:
