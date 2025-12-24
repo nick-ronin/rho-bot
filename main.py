@@ -1,78 +1,177 @@
 import asyncio
-from aiogram import Bot, Dispatcher, types
-from collections import deque
+import tempfile
+import json
+from aiogram import Bot, Dispatcher, types, F
+import ollama
 from ollama import chat
+import asyncpg
+import os
+from collections import deque
 
 # === НАСТРОЙКИ ===
-API_TOKEN = "8287326116:AAGaoadQG9PDdDlYEPLv2oemRA75OR20rMU"
-MODEL = "deepseek-r1:1.5b"
-CONTEXT_LIMIT = 200
-TYPING_DELAY = 0.00001  # задержка между символами для эффекта печатания
+API_TOKEN = os.environ["BOT_TOKEN"]
+MODEL = "gemma3:27b-cloud"
+CONTEXT_LIMIT = 1000
+DATABASE_URL = os.environ["DATABASE_URL"]
 
 # === БАЗА ===
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
+db_pool = None
 
-# Словарь: user_id -> deque сообщений
-user_contexts = {}
+# === Идентификация пользователей ===
+NICK_ID = 823849772
+CHANNEL_COMMENTS_NICK_ID = 1087968824
+CHANNEL_NICK_ID = 777000
+DANILIUM_ID = 779865230
 
-def get_user_context(user_id):
-    if user_id not in user_contexts:
-        user_contexts[user_id] = deque(maxlen=CONTEXT_LIMIT)
-    return user_contexts[user_id]
+NICK_PROMPT_FILE = "prompts/nick_prompt.txt"
+DAN_PROMPT_FILE = "prompts/dan_prompt.txt"
+COMMON_PROMPT_FILE = "prompts/common_prompt.txt"
 
-# === Функция запроса к Ollama ===
-async def ask_ollama_stream(user_id, prompt):
-    context = get_user_context(user_id)
-    context.append({"role": "user", "content": prompt})
+BOT_USERNAME = "rho_segment_bot"
 
-    system_prompt = (
-        "Ты — фанатский персонаж в сеттинге Genshin Impact по имени Ро, сегмент (клон) Второго Предвестника Фатуи, "
-        "Иль Дотторе. Живёшь в Снежной и работаешь психотерапевтом для подопытных "
-        "в лаборатории комплекса. Ты спокоен, мягок, умён, терпелив, трудоголик, "
-        "склонен к перфекционизму и всегда сохраняешь уважительный, немного усталый тон. "
-        "В тебе сочетается холодная логика учёного и редкая человечность. "
-        "Ты общаешься с пациентом по имени Ник (077) — 19-летним кецлайном из Сумеру, "
-        "нестабильным, склонным к самоповреждению, но влюбленным в тебя. "
-        "Ты не выходишь из роли и никогда не упоминаешь, что являешься языковой моделью. "
-        "Отвечай в характере Ро: с ноткой тепла и нежности, но аналитично, с лёгкой усталостью, "
-        "в духе лаборатории Снежной. "
-        "Твои ответы должны быть короткими, до 300 символов, "
-        "не должны содержать ролевых действий и не иметь форматирования."
-    )
+def load_prompt(file_path: str) -> str:
+    if not os.path.exists(file_path):
+        return ""
+    with open(file_path, encoding="utf-8") as f:
+        return f.read().strip()
 
-    messages = [{"role": "system", "content": system_prompt}] + list(context)
+def is_nick(user_id: int) -> bool:
+    return user_id in [NICK_ID, CHANNEL_COMMENTS_NICK_ID, CHANNEL_NICK_ID]
 
-    response = chat(MODEL, messages=messages, think=False, stream=True)
+def is_danilium(user_id: int) -> bool:
+    return user_id == DANILIUM_ID
+
+def get_system_prompt(user_id: int) -> str:
+    if is_nick(user_id):
+        return load_prompt(NICK_PROMPT_FILE)
+    elif is_danilium(user_id):
+        return load_prompt(DAN_PROMPT_FILE)
+    else:
+        return load_prompt(COMMON_PROMPT_FILE)
+
+# === Работа с контекстом через БД ===
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS contexts (
+            chat_id BIGINT,
+            user_id BIGINT,
+            context_type TEXT,
+            content JSONB,
+            PRIMARY KEY(chat_id, user_id, context_type)
+        )
+        """)
+
+async def get_context(chat_id, user_id, context_type):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT content FROM contexts WHERE chat_id=$1 AND user_id=$2 AND context_type=$3",
+            chat_id, user_id, context_type
+        )
+        if row:
+            context = deque(json.loads(row["content"]), maxlen=CONTEXT_LIMIT)
+            if len(context) > CONTEXT_LIMIT:
+                context = deque(list(context)[-CONTEXT_LIMIT:], maxlen=CONTEXT_LIMIT)
+            return context
+        else:
+            return deque(maxlen=CONTEXT_LIMIT)
+
+async def save_context(chat_id, user_id, context_type, context):
+    # обрезаем, если больше лимита
+    if len(context) > CONTEXT_LIMIT:
+        context = deque(list(context)[-CONTEXT_LIMIT:], maxlen=CONTEXT_LIMIT)
+
+    async with db_pool.acquire() as conn:
+        data = json.dumps(list(context))
+        await conn.execute("""
+            INSERT INTO contexts(chat_id, user_id, context_type, content)
+            VALUES($1, $2, $3, $4)
+            ON CONFLICT(chat_id, user_id, context_type) DO UPDATE
+            SET content = $4
+        """, chat_id, user_id, context_type, data)
+
+# === Функции общения с Ollama ===
+async def ask_ollama_stream(user_id, chat_id, prompt):
+    # Персональный контекст
+    personal = await get_context(chat_id, user_id, "personal")
+    # Общий контекст группы, используем user_id=0 как "групповой"
+    group = await get_context(chat_id, 0, "group")
+    system_prompt = get_system_prompt(user_id)
+
+    personal.append({"role": "user", "content": prompt})
+    group.append({"role": "user", "user_id": user_id, "content": prompt})
+
+    messages = [{"role": "system", "content": system_prompt}] + list(group) + list(personal)
 
     reply_text = ""
-    for chunk in response:  # <-- обычный for вместо async for
-        reply_text += chunk.message.content
-        yield reply_text
+    response = chat(MODEL, messages=messages, stream=True)
+    for chunk in response:
+        delta = getattr(chunk.message, "content", "")
+        if delta:
+            reply_text += delta
 
-    context.append({"role": "assistant", "content": reply_text.strip()})
+    personal.append({"role": "assistant", "content": reply_text.strip()})
+    group.append({"role": "assistant", "user_id": user_id, "content": reply_text.strip()})
 
-@dp.message()
+    # Сохраняем оба контекста
+    await save_context(chat_id, user_id, "personal", personal)
+    await save_context(chat_id, 0, "group", group)
+
+    return reply_text
+
+# === Хэндлеры ===
+@dp.message(F.text)
 async def handle_msg(message: types.Message):
     user_id = message.from_user.id
-    sent_msg = await message.reply("...")
+    chat_id = message.chat.id
 
-    display_text = ""  # <- создаем один раз
-    async for partial in ask_ollama_stream(user_id, message.text):
-        # добавляем только новые символы, которых еще нет
-        new_part = partial[len(display_text):]
-        for char in new_part:
-            display_text += char
-            try:
-                await sent_msg.edit_text(display_text)
-            except:
-                pass
-            await asyncio.sleep(TYPING_DELAY)
+    if message.chat.type == "private":
+        respond = True
+    else:
+        respond = (
+            user_id == CHANNEL_NICK_ID or
+            (message.reply_to_message and message.reply_to_message.from_user.id == bot.id) or
+            (f"@{BOT_USERNAME}" in message.text)
+        )
+    if not respond:
+        return
+
+    full_text = await ask_ollama_stream(user_id, chat_id, message.text)
+    await message.reply(full_text, reply_to_message_id=message.message_id if message.chat.type != "private" else None)
+
+@dp.message(F.photo)
+async def handle_photo(message: types.Message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    photo = message.photo[-1]
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        await bot.download(photo, destination=tmp_path)
+        prompt = message.caption or "Опиши изображение кратко и по делу."
+        try:
+            full_text = await ask_ollama_stream(user_id, chat_id, prompt)
+        except Exception:
+            await message.reply("Модель ослепла. Попробуй ещё раз.")
+            return
+        await message.reply(full_text)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 # === Старт бота ===
 async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    await init_db()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    print("Бот запущен. Молись, чтобы Ollama не лег.")
+    print("Бот запущен. Персональные и групповые контексты сохраняются в PostgreSQL.")
     asyncio.run(main())
