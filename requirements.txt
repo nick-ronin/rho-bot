@@ -1,4 +1,6 @@
 aiogram==3.23.0
 ollama==0.6.1
-deque
-asyncpg
+asyncio
+aiohttp
+psycopg2-binary
+SQLAlchemy
