@@ -13,7 +13,6 @@ MODEL = "gemma3:27b-cloud"
 CONTEXT_LIMIT = 1000
 DATABASE_URL = os.environ.get("DATABASE_URL")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "https://api.ollama.com")
 
 if not API_TOKEN:
     raise RuntimeError("Telegram BOT_TOKEN not set in environment variables")
@@ -26,7 +25,7 @@ if not OLLAMA_API_KEY:
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 db_pool = None
-ollama_client = Client(api_key=OLLAMA_API_KEY, base_url=OLLAMA_HOST)
+ollama_client = Client(api_key=OLLAMA_API_KEY)
 
 # === Идентификация пользователей ===
 NICK_ID = 823849772
