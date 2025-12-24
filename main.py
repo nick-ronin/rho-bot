@@ -63,7 +63,7 @@ async def init_db():
             chat_id BIGINT,
             user_id BIGINT,
             context_type TEXT,
-            content JSONB,
+            messages JSONB,
             PRIMARY KEY(chat_id, user_id, context_type)
         )
         """)
@@ -71,11 +71,11 @@ async def init_db():
 async def get_context(chat_id, user_id, context_type):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT content FROM contexts WHERE chat_id=$1 AND user_id=$2 AND context_type=$3",
+            "SELECT messages FROM contexts WHERE chat_id=$1 AND user_id=$2 AND context_type=$3",
             chat_id, user_id, context_type
         )
         if row:
-            context = deque(json.loads(row["content"]), maxlen=CONTEXT_LIMIT)
+            context = deque(json.loads(row["messages"]), maxlen=CONTEXT_LIMIT)
             if len(context) > CONTEXT_LIMIT:
                 context = deque(list(context)[-CONTEXT_LIMIT:], maxlen=CONTEXT_LIMIT)
             return context
@@ -90,10 +90,10 @@ async def save_context(chat_id, user_id, context_type, context):
     async with db_pool.acquire() as conn:
         data = json.dumps(list(context))
         await conn.execute("""
-            INSERT INTO contexts(chat_id, user_id, context_type, content)
+            INSERT INTO contexts(chat_id, user_id, context_type, messages)
             VALUES($1, $2, $3, $4)
             ON CONFLICT(chat_id, user_id, context_type) DO UPDATE
-            SET content = $4
+            SET messages = $4
         """, chat_id, user_id, context_type, data)
 
 # === Функции общения с Ollama ===
@@ -104,20 +104,20 @@ async def ask_ollama_stream(user_id, chat_id, prompt):
     group = await get_context(chat_id, 0, "group")
     system_prompt = get_system_prompt(user_id)
 
-    personal.append({"role": "user", "content": prompt})
-    group.append({"role": "user", "user_id": user_id, "content": prompt})
+    personal.append({"role": "user", "messages": prompt})
+    group.append({"role": "user", "user_id": user_id, "messages": prompt})
 
-    messages = [{"role": "system", "content": system_prompt}] + list(group) + list(personal)
+    messages = [{"role": "system", "messages": system_prompt}] + list(group) + list(personal)
 
     reply_text = ""
     response = chat(MODEL, messages=messages, stream=True)
     for chunk in response:
-        delta = getattr(chunk.message, "content", "")
+        delta = getattr(chunk.message, "messages", "")
         if delta:
             reply_text += delta
 
-    personal.append({"role": "assistant", "content": reply_text.strip()})
-    group.append({"role": "assistant", "user_id": user_id, "content": reply_text.strip()})
+    personal.append({"role": "assistant", "messages": reply_text.strip()})
+    group.append({"role": "assistant", "user_id": user_id, "messages": reply_text.strip()})
 
     # Сохраняем оба контекста
     await save_context(chat_id, user_id, "personal", personal)
