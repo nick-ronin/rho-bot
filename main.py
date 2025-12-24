@@ -2,7 +2,7 @@ import asyncio
 import tempfile
 import json
 from aiogram import Bot, Dispatcher, types, F
-from ollama import Ollama
+from ollama import chat, generate
 import asyncpg
 import os
 from collections import deque
@@ -12,21 +12,16 @@ API_TOKEN = os.environ.get("BOT_TOKEN")
 MODEL = "gemma3:27b-cloud"
 CONTEXT_LIMIT = 1000
 DATABASE_URL = os.environ.get("DATABASE_URL")
-OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "https://api.ollama.com")
 
 if not API_TOKEN:
-    raise RuntimeError("Telegram BOT_TOKEN not set in environment variables")
+    raise RuntimeError("Telegram BOT_TOKEN not set")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL not set in environment variables")
-if not OLLAMA_API_KEY:
-    raise RuntimeError("OLLAMA_API_KEY not set in environment variables")
+    raise RuntimeError("DATABASE_URL not set")
 
 # === БАЗА и Бот ===
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 db_pool = None
-ollama_client = Ollama(api_key=OLLAMA_API_KEY, base_url=OLLAMA_HOST)
 
 # === Идентификация пользователей ===
 NICK_ID = 823849772
@@ -82,21 +77,19 @@ async def get_context(chat_id, user_id, context_type):
             chat_id, user_id, context_type
         )
         if row:
-            context = deque(json.loads(row["messages"]), maxlen=CONTEXT_LIMIT)
-            return context
+            return deque(json.loads(row["messages"]), maxlen=CONTEXT_LIMIT)
         return deque(maxlen=CONTEXT_LIMIT)
 
 async def save_context(chat_id, user_id, context_type, context):
     if len(context) > CONTEXT_LIMIT:
         context = deque(list(context)[-CONTEXT_LIMIT:], maxlen=CONTEXT_LIMIT)
     async with db_pool.acquire() as conn:
-        data = json.dumps(list(context))
         await conn.execute("""
             INSERT INTO contexts(chat_id, user_id, context_type, messages)
             VALUES($1, $2, $3, $4)
             ON CONFLICT(chat_id, user_id, context_type) DO UPDATE
-            SET messages = $4
-        """, chat_id, user_id, context_type, data)
+            SET messages=$4
+        """, chat_id, user_id, context_type, json.dumps(list(context)))
 
 # === Функции общения с Ollama ===
 async def ask_ollama_stream(user_id, chat_id, prompt):
@@ -110,8 +103,7 @@ async def ask_ollama_stream(user_id, chat_id, prompt):
     messages = [{"role": "system", "content": system_prompt}] + list(group) + list(personal)
 
     reply_text = ""
-    response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
-    for chunk in response:
+    for chunk in chat(MODEL, messages=messages, stream=True):
         delta = getattr(chunk.message, "content", "")
         if delta:
             reply_text += delta
@@ -124,20 +116,37 @@ async def ask_ollama_stream(user_id, chat_id, prompt):
 
     return reply_text
 
+async def ask_ollama_image(user_id, chat_id, prompt, image_path):
+    personal = await get_context(chat_id, user_id, "personal")
+    system_prompt = get_system_prompt(user_id)
+
+    try:
+        res = generate(
+            model=MODEL,
+            prompt=prompt,
+            images=[image_path],
+            system=system_prompt,
+            options={"temperature": 0.3}
+        )
+        reply_text = res.get("response", "Не удалось распознать изображение.")
+    except Exception:
+        reply_text = "Не удалось распознать изображение."
+
+    personal.append({"role": "assistant", "content": reply_text.strip()})
+    await save_context(chat_id, user_id, "personal", personal)
+    return reply_text
+
 # === Хэндлеры ===
 @dp.message(F.text)
 async def handle_msg(message: types.Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
 
-    if message.chat.type == "private":
-        respond = True
-    else:
-        respond = (
-            user_id == CHANNEL_NICK_ID or
-            (message.reply_to_message and message.reply_to_message.from_user.id == bot.id) or
-            (f"@{BOT_USERNAME}" in message.text)
-        )
+    respond = message.chat.type == "private" or \
+              user_id == CHANNEL_NICK_ID or \
+              (message.reply_to_message and message.reply_to_message.from_user.id == bot.id) or \
+              (f"@{BOT_USERNAME}" in message.text)
+
     if not respond:
         return
 
@@ -155,7 +164,7 @@ async def handle_photo(message: types.Message):
     try:
         await bot.download(photo, destination=tmp_path)
         prompt = message.caption or "Опиши изображение кратко и по делу."
-        full_text = await ask_ollama_stream(user_id, chat_id, prompt)
+        full_text = await ask_ollama_image(user_id, chat_id, prompt, tmp_path)
         await message.reply(full_text)
     finally:
         try:
