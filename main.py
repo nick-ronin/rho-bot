@@ -72,7 +72,7 @@ async def init_db():
             context_type TEXT,
             messages JSONB,
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(chat_id, user_id, context_type)
+            UNIQUE(chat_id, user_id)
         )
         """)
 
