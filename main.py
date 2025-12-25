@@ -66,11 +66,13 @@ async def init_db():
     async with db_pool.acquire() as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS contexts (
+            id SERIAL PRIMARY KEY,
             chat_id BIGINT,
             user_id BIGINT,
             context_type TEXT,
             messages JSONB,
-            PRIMARY KEY(chat_id, user_id, context_type)
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(chat_id, user_id, context_type)
         )
         """)
 
