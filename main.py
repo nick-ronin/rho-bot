@@ -25,7 +25,7 @@ if not OLLAMA_API_KEY:
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 db_pool = None
-ollama_client = Client(api_key=OLLAMA_API_KEY)
+ollama_client = Client(host="https://ollama.com", headers={'Authorization': 'Bearer ' + os.environ.get('OLLAMA_API_KEY')})
 
 # === Идентификация пользователей ===
 NICK_ID = 823849772
