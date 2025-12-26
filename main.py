@@ -72,6 +72,29 @@ def get_limit(context_type: str) -> int:
         return GROUP_LIMIT
     return 20
 
+# Словарь для очередей на группы
+group_queues = {}  # chat_id -> asyncio.Queue()
+group_locks = {}   # chat_id -> asyncio.Lock() для синхронизации
+
+async def process_group_queue(chat_id):
+    """Обрабатываем очередь сообщений для группы по одному."""
+    if chat_id not in group_queues:
+        return
+    queue = group_queues[chat_id]
+    lock = group_locks[chat_id]
+
+    async with lock:  # чтобы только один воркер на чат
+        while not queue.empty():
+            user_id, prompt = await queue.get()
+            try:
+                reply = await ask_ollama_stream(user_id, chat_id, prompt)
+                # Тут можно отправлять результат в чат
+                await bot.send_message(chat_id, reply)
+            except Exception as e:
+                print(f"Error processing group message {chat_id}: {e}")
+            finally:
+                queue.task_done()
+
 # === Работа с контекстом через БД ===
 async def init_db():
     global db_pool
@@ -121,74 +144,89 @@ async def save_context(chat_id, user_id, context_type, context):
 # === Функции общения с Ollama ===
 async def ask_ollama_stream(user_id, chat_id, prompt):
     is_private = chat_id == user_id
-
     system_prompt = get_system_prompt(user_id)
-
     messages = [{"role": "system", "content": system_prompt}]
+    reply_text = ""
 
-    if is_private:
-        personal = await get_context(chat_id, user_id, "personal")
-        personal.append({"role": "user", "content": prompt})
-        messages += list(personal)
-        reply_text = ""
-        response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
-        for chunk in response:
-            delta = getattr(chunk.message, "content", "")
-            if delta:
-                reply_text += delta
-        personal.append({"role": "assistant", "content": reply_text.strip()})
-        await save_context(chat_id, user_id, "personal", personal)
-    elif not is_private:
-        group = await get_context(chat_id, 0, "group")
-        group.append({"role": "user", "user_id": user_id, "content": prompt})
-        messages += list(group)
-        reply_text = ""
-        response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
-        for chunk in response:
-            delta = getattr(chunk.message, "content", "")
-            if delta:
-                reply_text += delta
-        group.append({"role": "user", "content": f"[user:{user_id}] {prompt}"})
-        await save_context(chat_id, 0, "group", group)
-    else:
-        reply_text = "Ошибка определения типа чата. Как вы попали сюда?"    
+    try:
+        if is_private:
+            personal = await get_context(chat_id, user_id, "personal")
+            personal.append({"role": "user", "content": prompt})
+            messages += list(personal)
+
+            response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
+            for chunk in response:
+                delta = getattr(chunk.message, "content", "")
+                if delta:
+                    reply_text += delta
+
+            personal.append({"role": "assistant", "content": reply_text.strip()})
+            await save_context(chat_id, user_id, "personal", personal)
+
+        else:  # Группа
+            group = await get_context(chat_id, 0, "group")
+            group.append({"role": "user", "user_id": user_id, "content": prompt})
+            messages += list(group)
+
+            response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
+            for chunk in response:
+                delta = getattr(chunk.message, "content", "")
+                if delta:
+                    reply_text += delta
+
+            group.append({"role": "assistant", "user_id": user_id, "content": reply_text.strip()})
+            await save_context(chat_id, 0, "group", group)
+
+    except Exception as e:
+        # чтобы бот не падал на 500 или других ошибках
+        reply_text = "Сейчас бот не отвечает, попробуй позже."
+        print(f"Ollama error: {e}")
+
     return reply_text
+
 
 async def ask_ollama_image_stream(user_id, chat_id, prompt, image_path):
     is_private = chat_id == user_id
-
     system_prompt = get_system_prompt(user_id)
+    reply_text = ""
     image_b64 = image_to_base64(image_path)
-    image_content = f"<image>{image_b64}</image>"
+    content = f"<image>{image_b64}</image>\n{prompt}"
 
     messages = [{"role": "system", "content": system_prompt}]
 
-    if is_private:
-        personal = await get_context(chat_id, user_id, "personal")
-        personal.append({"role": "user", "content": f"{image_content}\n{prompt}"})
-        messages += list(personal)
-        reply_text = ""
-        response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
-        for chunk in response:
-            delta = getattr(chunk.message, "content", "")
-            if delta:
-                reply_text += delta
-        personal.append({"role": "assistant", "content": reply_text.strip()})
-        await save_context(chat_id, user_id, "personal", personal)
-    elif not is_private:
-        group = await get_context(chat_id, 0, "group")
-        group.append({"role": "user", "user_id": user_id, "content": f"{image_content}\n{prompt}"})
-        messages += list(group)
-        reply_text = ""
-        response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
-        for chunk in response:
-            delta = getattr(chunk.message, "content", "")
-            if delta:
-                reply_text += delta
-        group.append({"role": "user", "content": f"[user:{user_id}] {image_content}\n{prompt}"})
-        await save_context(chat_id, 0, "group", group)
-    else:
-        reply_text = "Ошибка определения типа чата. Как вы попали сюда?"    
+    try:
+        if is_private:
+            personal = await get_context(chat_id, user_id, "personal")
+            personal.append({"role": "user", "content": content})
+            messages += list(personal)
+
+            response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
+            for chunk in response:
+                delta = getattr(chunk.message, "content", "")
+                if delta:
+                    reply_text += delta
+
+            personal.append({"role": "assistant", "content": reply_text.strip()})
+            await save_context(chat_id, user_id, "personal", personal)
+
+        else:  # Группа
+            group = await get_context(chat_id, 0, "group")
+            group.append({"role": "user", "user_id": user_id, "content": content})
+            messages += list(group)
+
+            response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
+            for chunk in response:
+                delta = getattr(chunk.message, "content", "")
+                if delta:
+                    reply_text += delta
+
+            group.append({"role": "assistant", "user_id": user_id, "content": reply_text.strip()})
+            await save_context(chat_id, 0, "group", group)
+
+    except Exception as e:
+        reply_text = "Сейчас бот не отвечает, попробуй позже."
+        print(f"Ollama image error: {e}")
+
     return reply_text
 
 # === Хэндлеры ===
@@ -197,19 +235,26 @@ async def handle_msg(message: types.Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
 
-    if message.chat.type == "private":
-        respond = True
-    else:
-        respond = (
-            user_id == CHANNEL_NICK_ID or
-            (message.reply_to_message and message.reply_to_message.from_user.id == bot.id) or
-            (f"@{BOT_USERNAME}" in message.text)
-        )
+    is_private = message.chat.type == "private"
+    respond = is_private or (
+        user_id == CHANNEL_NICK_ID or
+        (message.reply_to_message and message.reply_to_message.from_user.id == bot.id) or
+        (f"@{BOT_USERNAME}" in message.text)
+    )
     if not respond:
         return
 
-    full_text = await ask_ollama_stream(user_id, chat_id, message.text)
-    await message.reply(full_text, reply_to_message_id=message.message_id if message.chat.type != "private" else None)
+    if is_private:
+        full_text = await ask_ollama_stream(user_id, chat_id, message.text)
+        await message.reply(full_text)
+    else:
+        # инициализируем очередь и лок для чата, если ещё нет
+        if chat_id not in group_queues:
+            group_queues[chat_id] = asyncio.Queue()
+            group_locks[chat_id] = asyncio.Lock()
+        await group_queues[chat_id].put((user_id, message.text))
+        # запустить обработку, если никого не обрабатываем
+        asyncio.create_task(process_group_queue(chat_id))
 
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
