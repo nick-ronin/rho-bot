@@ -5,3 +5,5 @@ aiohttp
 psycopg2-binary
 SQLAlchemy
 asyncpg
+python-dotenv
+pillow
