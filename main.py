@@ -107,6 +107,8 @@ async def save_context(chat_id, user_id, context_type, context):
     if len(context) > limit:
         context = deque(list(context)[-limit:], maxlen=limit)
 
+    data = json.dumps(list(context))
+
     async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO contexts(chat_id, user_id, context_type, messages)
