@@ -15,10 +15,6 @@ load_dotenv()
 # === НАСТРОЙКИ ===
 API_TOKEN = os.environ.get("BOT_TOKEN")
 MODEL = "gemma3:27b-cloud"
-# ВАЖНО: Gemma 3 27B - это текстовая модель! 
-# Для работы с изображениями нужно использовать vision-модель, например:
-# MODEL = "llava:latest"  # для локального запуска
-# MODEL = "qwen2.5-vl:latest"  # если есть в облаке
 PERSONAL_LIMIT = 30
 GROUP_LIMIT = 50
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -248,43 +244,56 @@ async def save_context(chat_id, user_id, context_type, context):
 async def ask_ollama_stream(user_id, chat_id, prompt, reply_to_message_id=None):
     is_private = chat_id == user_id
     system_prompt = get_system_prompt(user_id)
-    messages = [{"role": "system", "content": system_prompt}]
     reply_text = ""
+    max_history_messages = 20  # ограничение для лички/группы
+
+    messages = [{"role": "system", "content": system_prompt}]
 
     try:
         if is_private:
-            personal = await get_context(chat_id, user_id, "personal")
-            personal.append({"role": "user", "content": prompt})
-            messages += list(personal)
+            personal_history = await get_context(chat_id, user_id, "personal") or deque()
+            personal_history = list(personal_history)[-max_history_messages:]  # безопасный срез
 
-            response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
+            # Добавляем текущее сообщение пользователя
+            user_message = {"role": "user", "content": prompt}
+            all_messages = messages + personal_history + [user_message]
+
+            response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
             for chunk in response:
                 delta = getattr(chunk.message, "content", "")
                 if delta:
                     reply_text += delta
 
-            personal.append({"role": "assistant", "content": reply_text.strip()})
-            await save_context(chat_id, user_id, "personal", personal)
+            # Сохраняем в историю
+            await update_history(chat_id, user_id, "user", prompt, "personal", max_len=PERSONAL_LIMIT)
+            await update_history(chat_id, user_id, "assistant", reply_text.strip(), "personal", max_len=PERSONAL_LIMIT)
 
-        else:  # Группа
-            group = await get_context(chat_id, 0, "group")
-            group.append({"role": "user", "user_id": user_id, "content": prompt})
-            messages += list(group)
+        else:
+            group_history = await get_context(chat_id, 0, "group") or deque()
+            group_history = list(group_history)[-max_history_messages:]  # безопасный срез
 
-            response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
+            # Фильтруем поля, чтобы Ollama принимала
+            cleaned_history = [{"role": msg["role"], "content": msg["content"]} for msg in group_history if "content" in msg and "role" in msg]
+
+            user_message = {"role": "user", "content": prompt}
+            all_messages = messages + cleaned_history + [user_message]
+
+            response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
             for chunk in response:
                 delta = getattr(chunk.message, "content", "")
                 if delta:
                     reply_text += delta
 
-            group.append({"role": "assistant", "user_id": user_id, "content": reply_text.strip()})
-            await save_context(chat_id, 0, "group", group)
+            # Сохраняем в историю группы с user_id
+            await update_history(chat_id, user_id, "user", prompt, "group", max_len=GROUP_LIMIT)
+            await update_history(chat_id, user_id, "assistant", reply_text.strip(), "group", max_len=GROUP_LIMIT)
 
     except Exception as e:
         reply_text = "Сейчас бот не отвечает, попробуй позже."
         print(f"Ollama error: {e}")
 
     return reply_text, reply_to_message_id
+
 
 
 async def ask_ollama_image_stream(user_id, chat_id, prompt, image_path):
