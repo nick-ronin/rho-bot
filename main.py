@@ -9,8 +9,7 @@ from collections import deque
 from dotenv import load_dotenv
 from PIL import Image
 import io
-
-load_dotenv()
+import base64
 
 # === НАСТРОЙКИ ===
 API_TOKEN = os.environ.get("BOT_TOKEN")
@@ -21,17 +20,19 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
 
 if not API_TOKEN:
-    raise RuntimeError("Telegram BOT_TOKEN not set in environment variables")
+    raise RuntimeError("Telegram BOT_TOKEN not set")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL not set in environment variables")
+    raise RuntimeError("DATABASE_URL not set")
 if not OLLAMA_API_KEY:
-    raise RuntimeError("OLLAMA_API_KEY not set in environment variables")
+    raise RuntimeError("OLLAMA_API_KEY not set")
 
-# === БАЗА и Бот ===
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 db_pool = None
-ollama_client = Client(host="https://ollama.com", headers={'Authorization': 'Bearer ' + os.environ.get('OLLAMA_API_KEY')})
+ollama_client = Client(
+    host="https://ollama.com", 
+    headers={'Authorization': f'Bearer {OLLAMA_API_KEY}'}
+)
 
 # === Идентификация пользователей ===
 NICK_ID = 823849772
@@ -50,50 +51,12 @@ def load_prompt(file_path: str) -> str:
         return ""
     with open(file_path, encoding="utf-8") as f:
         return f.read().strip()
-    
-def get_user_identity(user_id: int):
-    if is_nick(user_id):
-        return load_prompt(NICK_PROMPT_FILE)
-    elif is_danilium(user_id):
-        return load_prompt(DAN_PROMPT_FILE)
-    else:
-        return load_prompt(COMMON_PROMPT_FILE)
 
 def is_nick(user_id: int) -> bool:
     return user_id in [NICK_ID, CHANNEL_COMMENTS_NICK_ID, CHANNEL_NICK_ID]
 
 def is_danilium(user_id: int) -> bool:
     return user_id == DANILIUM_ID
-
-def resize_image(image_path, max_size=(512, 512), quality=85):
-    """
-    Уменьшает размер изображения для обработки в модели
-    """
-    try:
-        with Image.open(image_path) as img:
-            # Конвертируем в RGB если нужно
-            if img.mode in ('RGBA', 'LA', 'P'):
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                if img.mode == 'RGBA':
-                    background.paste(img, mask=img.split()[-1])
-                else:
-                    background.paste(img, (0, 0))
-                img = background
-            elif img.mode != 'RGB':
-                img = img.convert('RGB')
-            
-            # Изменяем размер сохраняя пропорции
-            img.thumbnail(max_size, Image.Resampling.LANCZOS)
-            
-            # Сохраняем в буфер
-            buffer = io.BytesIO()
-            img.save(buffer, format='JPEG', quality=quality, optimize=True)
-            buffer.seek(0)
-            
-            return buffer
-    except Exception as e:
-        print(f"Error resizing image: {e}")
-        return None
 
 def get_system_prompt(user_id: int) -> str:
     if is_nick(user_id):
@@ -103,6 +66,37 @@ def get_system_prompt(user_id: int) -> str:
     else:
         return load_prompt(COMMON_PROMPT_FILE)
 
+def resize_image(image_path, max_size=(512, 512), quality=85):
+    try:
+        with Image.open(image_path) as img:
+            if img.mode in ('RGBA', 'LA', 'P'):
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'RGBA':
+                    background.paste(img, mask=img.split()[-1])
+                else:
+                    background.paste(img, (0, 0))
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG', quality=quality, optimize=True)
+            buffer.seek(0)
+            return buffer
+    except Exception as e:
+        print(f"Error resizing image: {e}")
+        return None
+
+def image_to_base64(image_path, max_size=(512, 512), quality=85):
+    buffer = resize_image(image_path, max_size=max_size, quality=quality)
+    if not buffer:
+        return None
+    # base64 без переносов
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii").replace("\n", "")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
 def get_limit(context_type: str) -> int:
     if context_type == "personal":
         return PERSONAL_LIMIT
@@ -110,56 +104,31 @@ def get_limit(context_type: str) -> int:
         return GROUP_LIMIT
     return 20
 
-async def update_history(chat_id, user_id, role, content, history_type="personal", max_len=20):
-    base_user_id = user_id if history_type == "personal" else 0
-    raw_history = await get_context(chat_id, base_user_id, history_type)
-    # Всегда работаем с deque нужной длины, без срезов
-    history = deque(raw_history or [], maxlen=max_len)
-
-    if history_type == "group":
-        history.append({"role": role, "user_id": user_id, "content": content})
-    else:
-        history.append({"role": role, "content": content})
-
-    await save_context(chat_id, base_user_id, history_type, history)
-    return history
-
-# Очереди для групповых сообщений
-group_text_queues = {}   # chat_id -> asyncio.Queue()
-group_text_locks = {}    # chat_id -> asyncio.Lock() для текста
-group_image_queues = {}  # chat_id -> asyncio.Queue()
-group_image_locks = {}   # chat_id -> asyncio.Lock() для изображений
+# === Очереди ===
+group_text_queues = {}
+group_text_locks = {}
+group_image_queues = {}
+group_image_locks = {}
 
 async def process_group_queue(chat_id):
-    """Обрабатываем очередь текстовых сообщений для группы по одному."""
     if chat_id not in group_text_queues:
         return
     queue = group_text_queues[chat_id]
     lock = group_text_locks[chat_id]
 
-    async with lock:  # чтобы только один воркер на чат
+    async with lock:
         while not queue.empty():
-            print(f"Сообщений в очереди: {queue.qsize()}")
             user_id, prompt, message_id = await queue.get()
             try:
-                reply_text, _ = await ask_ollama_stream(user_id, chat_id, prompt, message_id)
-                
-                # Отправляем ответ реплаем с правильными параметрами
+                reply_text, _ = await ask_ollama_text(user_id, chat_id, prompt, message_id)
                 if reply_text:
-                    await bot.send_message(
-                        chat_id, 
-                        reply_text,
-                        reply_parameters=types.ReplyParameters(
-                            message_id=message_id
-                        )
-                    )
+                    await bot.send_message(chat_id, reply_text, reply_parameters=types.ReplyParameters(message_id=message_id))
             except Exception as e:
-                print(f"Error processing group message {chat_id}: {e}")
+                print(f"Error processing group text {chat_id}: {e}")
             finally:
                 queue.task_done()
 
 async def process_group_image_queue(chat_id):
-    """Обрабатываем очередь изображений для группы."""
     if chat_id not in group_image_queues:
         return
     queue = group_image_queues[chat_id]
@@ -169,24 +138,11 @@ async def process_group_image_queue(chat_id):
         while not queue.empty():
             try:
                 user_id, prompt, message_id, image_path = await queue.get()
-
-                full_text = await ask_ollama_image_stream(user_id, chat_id, prompt, image_path)
-
+                full_text = await ask_ollama_image(user_id, chat_id, prompt, image_path)
                 if full_text:
-                    await bot.send_message(
-                        chat_id,
-                        full_text,
-                        reply_parameters=types.ReplyParameters(
-                            message_id=message_id
-                        )
-                    )
-
-                try:
-                    if os.path.exists(image_path):
-                        os.remove(image_path)
-                except Exception:
-                    pass
-
+                    await bot.send_message(chat_id, full_text, reply_parameters=types.ReplyParameters(message_id=message_id))
+                if os.path.exists(image_path):
+                    os.remove(image_path)
             except Exception as e:
                 print(f"Error processing group image {chat_id}: {e}")
             finally:
@@ -224,127 +180,75 @@ async def get_context(chat_id, user_id, context_type):
 
 async def save_context(chat_id, user_id, context_type, context):
     limit = get_limit(context_type)
-    context = deque(context, maxlen=limit)
+    if len(context) > limit:
+        context = deque(list(context)[-limit:], maxlen=limit)
     data = json.dumps(list(context))
-
     async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO contexts(chat_id, user_id, context_type, messages)
             VALUES($1, $2, $3, $4)
             ON CONFLICT(chat_id, user_id, context_type) DO UPDATE
-            SET messages = $4,
-            updated_at = CURRENT_TIMESTAMP
+            SET messages=$4, updated_at=CURRENT_TIMESTAMP
         """, chat_id, user_id, context_type, data)
 
-# === Функции общения с Ollama ===
-async def ask_ollama_stream(user_id, chat_id, prompt, reply_to_message_id=None):
+# === Текстовые сообщения ===
+async def ask_ollama_text(user_id, chat_id, prompt, reply_to_message_id=None):
     is_private = chat_id == user_id
     system_prompt = get_system_prompt(user_id)
     reply_text = ""
-    max_history_messages = 20  # ограничение для истории
-
     messages = [{"role": "system", "content": system_prompt}]
 
     try:
-        if is_private:
-            # Получаем историю как deque с лимитом
-            personal_history = await get_context(chat_id, user_id, "personal") or deque(maxlen=max_history_messages)
+        history = await get_context(chat_id, user_id if is_private else 0, "personal" if is_private else "group")
+        all_messages = messages + list(history) + [{"role": "user", "content": prompt}]
+        response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
+        for chunk in response:
+            delta = getattr(chunk.message, "content", "")
+            if delta:
+                reply_text += delta
 
-            # Формируем все сообщения для Ollama
-            all_messages = messages + list(personal_history) + [{"role": "user", "content": prompt}]
-
-            response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
-            for chunk in response:
-                delta = getattr(chunk.message, "content", "")
-                if delta:
-                    reply_text += delta
-
-            # Сохраняем в истории
-            await update_history(chat_id, user_id, "user", prompt, "personal", max_len=PERSONAL_LIMIT)
-            await update_history(chat_id, user_id, "assistant", reply_text.strip(), "personal", max_len=PERSONAL_LIMIT)
-
-        else:
-            # Групповая история
-            group_history = await get_context(chat_id, 0, "group") or deque(maxlen=max_history_messages)
-
-            # Фильтруем только нужные поля
-            cleaned_history = [{"role": msg["role"], "content": msg["content"]} 
-                               for msg in group_history 
-                               if "role" in msg and "content" in msg]
-
-            all_messages = messages + cleaned_history + [{"role": "user", "content": prompt}]
-
-            response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
-            for chunk in response:
-                delta = getattr(chunk.message, "content", "")
-                if delta:
-                    reply_text += delta
-
-            # Сохраняем историю группы
-            await update_history(chat_id, user_id, "user", prompt, "group", max_len=GROUP_LIMIT)
-            await update_history(chat_id, user_id, "assistant", reply_text.strip(), "group", max_len=GROUP_LIMIT)
+        history.append({"role": "user", "content": prompt if is_private else "group user message"})
+        history.append({"role": "assistant", "content": reply_text.strip()})
+        await save_context(chat_id, user_id if is_private else 0, "personal" if is_private else "group", history)
 
     except Exception as e:
         reply_text = "Сейчас бот не отвечает, попробуй позже."
-        print(f"Ollama error: {e}")
+        print(f"Ollama text error: {e}")
 
     return reply_text, reply_to_message_id
 
-
-async def ask_ollama_image_stream(user_id, chat_id, prompt, image_path):
-    is_private = chat_id == user_id
+# === Изображения (с base64) ===
+async def ask_ollama_image(user_id, chat_id, prompt, image_path):
     system_prompt = get_system_prompt(user_id)
     reply_text = ""
-    max_history_messages = 5
-
     messages = [{"role": "system", "content": system_prompt}]
+    max_history_messages = 2
 
     try:
-        if is_private:
-            personal_history = await get_context(chat_id, user_id, "personal") or deque()
-            while len(personal_history) > max_history_messages:
-                personal_history.popleft()
-            personal_history = deque(personal_history, maxlen=max_history_messages)
+        history = await get_context(chat_id, user_id if chat_id == user_id else 0,
+                                    "personal" if chat_id == user_id else "group")
+        recent_history = list(history)[-max_history_messages:]
 
-            user_message = {"role": "user", "content": prompt, "images": [image_path]}
-            all_messages = messages + list(personal_history) + [user_message]
+        # Передаём путь к файлу напрямую
+        user_message = {"role": "user", "content": prompt, "images": [image_path]}
+        all_messages = messages + recent_history + [user_message]
 
-            response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
-            for chunk in response:
-                delta = getattr(chunk.message, "content", "")
-                if delta:
-                    reply_text += delta
+        response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
+        for chunk in response:
+            delta = getattr(chunk.message, "content", "")
+            if delta:
+                reply_text += delta
 
-            await update_history(chat_id, user_id, "user", "image received", "personal", max_len=20)
-            await update_history(chat_id, user_id, "assistant", reply_text.strip(), "personal", max_len=20)
-
-        else:
-            group_history = await get_context(chat_id, 0, "group") or deque()
-            while len(group_history) > max_history_messages:
-                group_history.popleft()
-            group_history = deque(group_history, maxlen=max_history_messages)
-
-            user_message = {"role": "user", "content": prompt, "images": [image_path]}
-            cleaned_history = [{"role": msg["role"], "content": msg["content"]} for msg in group_history if "content" in msg]
-            all_messages = messages + cleaned_history + [user_message]
-
-            response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
-            for chunk in response:
-                delta = getattr(chunk.message, "content", "")
-                if delta:
-                    reply_text += delta
-
-            await update_history(chat_id, user_id, "user", "image received", "group", max_len=30)
-            await update_history(chat_id, user_id, "assistant", reply_text.strip(), "group", max_len=30)
+        history.append({"role": "user", "content": "image received"})
+        history.append({"role": "assistant", "content": reply_text.strip()})
+        limit = PERSONAL_LIMIT if chat_id == user_id else GROUP_LIMIT
+        if len(history) > limit:
+            history = deque(list(history)[-limit:], maxlen=limit)
+        await save_context(chat_id, user_id if chat_id == user_id else 0,
+                           "personal" if chat_id == user_id else "group", history)
 
     except Exception as e:
-        error_msg = str(e)
-        if "prompt too long" in error_msg:
-            reply_text = "Изображение слишком большое, попробуйте отправить изображение меньшего размера."
-        elif "does not support images" in error_msg or "vision" in error_msg.lower():
-            reply_text = "Выбранная модель не поддерживает обработку изображений. Пожалуйста, используйте другую модель."
-        else:
-            reply_text = "Сейчас бот не отвечает, попробуй позже."
+        reply_text = "Сейчас бот не отвечает, попробуй позже."
         print(f"Ollama image error: {e}")
 
     return reply_text
@@ -355,19 +259,13 @@ async def ask_ollama_image_stream(user_id, chat_id, prompt, image_path):
 async def handle_msg(message: types.Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
-
     is_private = message.chat.type == "private"
-    respond = is_private or (
-        user_id == CHANNEL_NICK_ID or
-        (message.reply_to_message and message.reply_to_message.from_user.id == bot.id) or
-        (f"@{BOT_USERNAME}" in message.text)
-    )
+    respond = is_private or (user_id == CHANNEL_NICK_ID or (message.reply_to_message and message.reply_to_message.from_user.id == bot.id) or (f"@{BOT_USERNAME}" in message.text))
     if not respond:
         return
 
     if is_private:
-        # Для личных сообщений - обычный reply
-        full_text, _ = await ask_ollama_stream(user_id, chat_id, message.text, message.message_id)
+        full_text, _ = await ask_ollama_text(user_id, chat_id, message.text, message.message_id)
         await message.reply(full_text)
     else:
         if chat_id not in group_text_queues:
@@ -380,79 +278,44 @@ async def handle_msg(message: types.Message):
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
-
     is_private = message.chat.type == "private"
-    
-    # Проверяем, должен ли бот отвечать (аналогично текстовым сообщениям)
-    respond = is_private or (
-        user_id == CHANNEL_NICK_ID or
-        (message.reply_to_message and message.reply_to_message.from_user.id == bot.id) or
-        (f"@{BOT_USERNAME}" in (message.caption or ""))
-    )
-    
+    respond = is_private or (user_id == CHANNEL_NICK_ID or (message.reply_to_message and message.reply_to_message.from_user.id == bot.id) or (f"@{BOT_USERNAME}" in (message.caption or "")))
     if not respond:
         return
 
     photo = message.photo[-1]
-    
-    # Создаем два временных файла: оригинал и уменьшенный
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         tmp_path = tmp.name
-    
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as resized_tmp:
         resized_path = resized_tmp.name
-    
+
     try:
-        # Скачиваем оригинал
         await bot.download(photo.file_id, destination=tmp_path)
-        
-        # Уменьшаем изображение
-        buffer = resize_image(tmp_path, max_size=(512, 512), quality=85)
-        if buffer is None:
-            if is_private:
-                await message.reply("Не удалось обработать изображение.")
-            else:
-                # В группе тоже реплаем
-                await bot.send_message(
-                    chat_id,
-                    "Не удалось обработать изображение.",
-                    reply_parameters=types.ReplyParameters(
-                        message_id=message.message_id
-                    )
-                )
+        buffer = resize_image(tmp_path)
+        if not buffer:
+            await message.reply("Не удалось обработать изображение.") if is_private else await bot.send_message(chat_id, "Не удалось обработать изображение.", reply_parameters=types.ReplyParameters(message_id=message.message_id))
             return
-        
-        # Сохраняем уменьшенное изображение
+
         with open(resized_path, 'wb') as f:
             f.write(buffer.getvalue())
-        
         prompt = message.caption or "Опиши изображение кратко и по делу."
-        
-        # Отправляем статус "печатает"
         await message.bot.send_chat_action(chat_id, "typing")
-        
+
         if is_private:
-            full_text = await ask_ollama_image_stream(user_id, chat_id, prompt, resized_path)
+            full_text = await ask_ollama_image(user_id, chat_id, prompt, resized_path)
             await message.reply(full_text)
         else:
             if chat_id not in group_image_queues:
                 group_image_queues[chat_id] = asyncio.Queue()
                 group_image_locks[chat_id] = asyncio.Lock()
-
             await group_image_queues[chat_id].put((user_id, prompt, message.message_id, resized_path))
             asyncio.create_task(process_group_image_queue(chat_id))
-
     finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-
+        try: os.remove(tmp_path)
+        except Exception: pass
         if is_private:
-            try:
-                os.remove(resized_path)
-            except Exception:
-                pass
+            try: os.remove(resized_path)
+            except Exception: pass
 
 # === Старт бота ===
 async def main():
@@ -461,5 +324,5 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    print("Бот запущен. Дай боже не ебнется.")
+    print("Бот запущен. Дай бог не ебнется")
     asyncio.run(main())
