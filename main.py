@@ -302,16 +302,16 @@ async def ask_ollama_image_stream(user_id, chat_id, prompt, image_path):
     reply_text = ""
     max_history_messages = 5
 
-    messages = [{"role": "system", "content": system_prompt}]
-
     try:
+        messages = [{"role": "system", "content": system_prompt}]
+
         if is_private:
             personal_history = await get_context(chat_id, user_id, "personal") or deque(maxlen=max_history_messages)
-            # Просто добавляем в конец, старые автоматически выкинутся, если больше maxlen
-            user_message = {"role": "user", "content": prompt, "images": [image_path]}
+            user_message = {"role": "user", "content": prompt}
             all_messages = messages + list(personal_history) + [user_message]
 
-            response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
+            # Передаем изображение через image=path
+            response = ollama_client.chat(model=MODEL, messages=all_messages, image=image_path, stream=True)
             for chunk in response:
                 delta = getattr(chunk.message, "content", "")
                 if delta:
@@ -322,11 +322,11 @@ async def ask_ollama_image_stream(user_id, chat_id, prompt, image_path):
 
         else:
             group_history = await get_context(chat_id, 0, "group") or deque(maxlen=max_history_messages)
-            user_message = {"role": "user", "content": prompt, "images": [image_path]}
+            user_message = {"role": "user", "content": prompt}
             cleaned_history = [{"role": msg["role"], "content": msg["content"]} for msg in group_history if "content" in msg]
             all_messages = messages + cleaned_history + [user_message]
 
-            response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
+            response = ollama_client.chat(model=MODEL, messages=all_messages, image=image_path, stream=True)
             for chunk in response:
                 delta = getattr(chunk.message, "content", "")
                 if delta:
@@ -346,6 +346,7 @@ async def ask_ollama_image_stream(user_id, chat_id, prompt, image_path):
         print(f"Ollama image error: {e}")
 
     return reply_text
+
 
 
 
