@@ -79,12 +79,15 @@ async def init_db():
     async with db_pool.acquire() as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS contexts (
-            chat_id BIGINT,
-            user_id BIGINT,
-            context_type TEXT,
+            id SERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            context_type TEXT NOT NULL,
             messages JSONB,
-            PRIMARY KEY(chat_id, user_id, context_type)
-        )
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS contexts_unique_idx
+        ON contexts (chat_id, user_id, context_type);
         """)
 
 async def get_context(chat_id, user_id, context_type):
@@ -108,10 +111,10 @@ async def save_context(chat_id, user_id, context_type, context):
         await conn.execute("""
             INSERT INTO contexts(chat_id, user_id, context_type, messages)
             VALUES($1, $2, $3, $4)
-            ON CONFLICT(chat_id, user_id, context_type)
-            DO UPDATE SET messages = EXCLUDED.messages
-        """, chat_id, user_id, context_type, json.dumps(list(context)))
-
+            ON CONFLICT(chat_id, user_id, context_type) DO UPDATE
+            SET messages = $4,
+            updated_at = CURRENT_TIMESTAMP
+        """, chat_id, user_id, context_type, data)
 
 # === Функции общения с Ollama ===
 async def ask_ollama_stream(user_id, chat_id, prompt):
