@@ -111,19 +111,17 @@ def get_limit(context_type: str) -> int:
     return 20
 
 async def update_history(chat_id, user_id, role, content, history_type="personal", max_len=20):
-    history = await get_context(chat_id, user_id if history_type=="personal" else 0, history_type) or []
-    
-    # Добавляем новое сообщение
+    base_user_id = user_id if history_type == "personal" else 0
+    raw_history = await get_context(chat_id, base_user_id, history_type)
+    # Всегда работаем с deque нужной длины, без срезов
+    history = deque(raw_history or [], maxlen=max_len)
+
     if history_type == "group":
         history.append({"role": role, "user_id": user_id, "content": content})
     else:
         history.append({"role": role, "content": content})
 
-    # Обрезаем, если больше лимита
-    if len(history) > max_len:
-        history = history[-max_len:]
-
-    await save_context(chat_id, user_id if history_type=="personal" else 0, history_type, history)
+    await save_context(chat_id, base_user_id, history_type, history)
     return history
 
 # Очереди для групповых сообщений
@@ -226,9 +224,7 @@ async def get_context(chat_id, user_id, context_type):
 
 async def save_context(chat_id, user_id, context_type, context):
     limit = get_limit(context_type)
-    if len(context) > limit:
-        context = deque(list(context)[-limit:], maxlen=limit)
-
+    context = deque(context, maxlen=limit)
     data = json.dumps(list(context))
 
     async with db_pool.acquire() as conn:
@@ -244,37 +240,49 @@ async def save_context(chat_id, user_id, context_type, context):
 async def ask_ollama_stream(user_id, chat_id, prompt, reply_to_message_id=None):
     is_private = chat_id == user_id
     system_prompt = get_system_prompt(user_id)
-    messages = [{"role": "system", "content": system_prompt}]
     reply_text = ""
+    max_history_messages = 20  # ограничение для истории
+
+    messages = [{"role": "system", "content": system_prompt}]
 
     try:
         if is_private:
-            personal = await get_context(chat_id, user_id, "personal")
-            personal.append({"role": "user", "content": prompt})
-            messages += list(personal)
+            # Получаем историю как deque с лимитом
+            personal_history = await get_context(chat_id, user_id, "personal") or deque(maxlen=max_history_messages)
 
-            response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
+            # Формируем все сообщения для Ollama
+            all_messages = messages + list(personal_history) + [{"role": "user", "content": prompt}]
+
+            response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
             for chunk in response:
                 delta = getattr(chunk.message, "content", "")
                 if delta:
                     reply_text += delta
 
-            personal.append({"role": "assistant", "content": reply_text.strip()})
-            await save_context(chat_id, user_id, "personal", personal)
+            # Сохраняем в истории
+            await update_history(chat_id, user_id, "user", prompt, "personal", max_len=PERSONAL_LIMIT)
+            await update_history(chat_id, user_id, "assistant", reply_text.strip(), "personal", max_len=PERSONAL_LIMIT)
 
-        else:  # Группа
-            group = await get_context(chat_id, 0, "group")
-            group.append({"role": "user", "user_id": user_id, "content": prompt})
-            messages += list(group)
+        else:
+            # Групповая история
+            group_history = await get_context(chat_id, 0, "group") or deque(maxlen=max_history_messages)
 
-            response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
+            # Фильтруем только нужные поля
+            cleaned_history = [{"role": msg["role"], "content": msg["content"]} 
+                               for msg in group_history 
+                               if "role" in msg and "content" in msg]
+
+            all_messages = messages + cleaned_history + [{"role": "user", "content": prompt}]
+
+            response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
             for chunk in response:
                 delta = getattr(chunk.message, "content", "")
                 if delta:
                     reply_text += delta
 
-            group.append({"role": "assistant", "user_id": user_id, "content": reply_text.strip()})
-            await save_context(chat_id, 0, "group", group)
+            # Сохраняем историю группы
+            await update_history(chat_id, user_id, "user", prompt, "group", max_len=GROUP_LIMIT)
+            await update_history(chat_id, user_id, "assistant", reply_text.strip(), "group", max_len=GROUP_LIMIT)
 
     except Exception as e:
         reply_text = "Сейчас бот не отвечает, попробуй позже."
@@ -287,17 +295,19 @@ async def ask_ollama_image_stream(user_id, chat_id, prompt, image_path):
     is_private = chat_id == user_id
     system_prompt = get_system_prompt(user_id)
     reply_text = ""
-    
     max_history_messages = 5
+
     messages = [{"role": "system", "content": system_prompt}]
 
     try:
         if is_private:
-            personal = await get_context(chat_id, user_id, "personal") or deque(maxlen=max_history_messages)
-            personal = deque(list(personal)[-max_history_messages:], maxlen=max_history_messages)
+            personal_history = await get_context(chat_id, user_id, "personal") or deque()
+            while len(personal_history) > max_history_messages:
+                personal_history.popleft()
+            personal_history = deque(personal_history, maxlen=max_history_messages)
 
             user_message = {"role": "user", "content": prompt, "images": [image_path]}
-            all_messages = messages + list(personal) + [user_message]
+            all_messages = messages + list(personal_history) + [user_message]
 
             response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
             for chunk in response:
@@ -305,19 +315,17 @@ async def ask_ollama_image_stream(user_id, chat_id, prompt, image_path):
                 if delta:
                     reply_text += delta
 
-            personal.append({"role": "user", "content": "image received"})
-            personal.append({"role": "assistant", "content": reply_text.strip()})
-            if len(personal) > 20:
-                personal = deque(list(personal)[-20:], maxlen=20)
-            await save_context(chat_id, user_id, "personal", personal)
+            await update_history(chat_id, user_id, "user", "image received", "personal", max_len=20)
+            await update_history(chat_id, user_id, "assistant", reply_text.strip(), "personal", max_len=20)
 
-        else:  # Группа
-            group = await get_context(chat_id, 0, "group") or deque(maxlen=max_history_messages)
-            group = deque(list(group)[-max_history_messages:], maxlen=max_history_messages)
+        else:
+            group_history = await get_context(chat_id, 0, "group") or deque()
+            while len(group_history) > max_history_messages:
+                group_history.popleft()
+            group_history = deque(group_history, maxlen=max_history_messages)
 
             user_message = {"role": "user", "content": prompt, "images": [image_path]}
-
-            cleaned_history = [{"role": msg["role"], "content": msg["content"]} for msg in group if "content" in msg]
+            cleaned_history = [{"role": msg["role"], "content": msg["content"]} for msg in group_history if "content" in msg]
             all_messages = messages + cleaned_history + [user_message]
 
             response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
@@ -326,11 +334,8 @@ async def ask_ollama_image_stream(user_id, chat_id, prompt, image_path):
                 if delta:
                     reply_text += delta
 
-            group.append({"role": "user", "user_id": user_id, "content": "image received"})
-            group.append({"role": "assistant", "user_id": user_id, "content": reply_text.strip()})
-            if len(group) > 30:
-                group = deque(list(group)[-30:], maxlen=30)
-            await save_context(chat_id, 0, "group", group)
+            await update_history(chat_id, user_id, "user", "image received", "group", max_len=30)
+            await update_history(chat_id, user_id, "assistant", reply_text.strip(), "group", max_len=30)
 
     except Exception as e:
         error_msg = str(e)
