@@ -245,18 +245,17 @@ async def ask_ollama_stream(user_id, chat_id, prompt, reply_to_message_id=None):
     is_private = chat_id == user_id
     system_prompt = get_system_prompt(user_id)
     reply_text = ""
-    max_history_messages = 20  # ограничение для лички/группы
+    max_history_messages = 20  # ограничение для истории
 
     messages = [{"role": "system", "content": system_prompt}]
 
     try:
         if is_private:
-            personal_history = await get_context(chat_id, user_id, "personal") or deque()
-            personal_history = list(personal_history)[-max_history_messages:]  # безопасный срез
+            # Получаем историю как deque с лимитом
+            personal_history = await get_context(chat_id, user_id, "personal") or deque(maxlen=max_history_messages)
 
-            # Добавляем текущее сообщение пользователя
-            user_message = {"role": "user", "content": prompt}
-            all_messages = messages + personal_history + [user_message]
+            # Формируем все сообщения для Ollama
+            all_messages = messages + list(personal_history) + [{"role": "user", "content": prompt}]
 
             response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
             for chunk in response:
@@ -264,19 +263,20 @@ async def ask_ollama_stream(user_id, chat_id, prompt, reply_to_message_id=None):
                 if delta:
                     reply_text += delta
 
-            # Сохраняем в историю
+            # Сохраняем в истории
             await update_history(chat_id, user_id, "user", prompt, "personal", max_len=PERSONAL_LIMIT)
             await update_history(chat_id, user_id, "assistant", reply_text.strip(), "personal", max_len=PERSONAL_LIMIT)
 
         else:
-            group_history = await get_context(chat_id, 0, "group") or deque()
-            group_history = list(group_history)[-max_history_messages:]  # безопасный срез
+            # Групповая история
+            group_history = await get_context(chat_id, 0, "group") or deque(maxlen=max_history_messages)
 
-            # Фильтруем поля, чтобы Ollama принимала
-            cleaned_history = [{"role": msg["role"], "content": msg["content"]} for msg in group_history if "content" in msg and "role" in msg]
+            # Фильтруем только нужные поля
+            cleaned_history = [{"role": msg["role"], "content": msg["content"]} 
+                               for msg in group_history 
+                               if "role" in msg and "content" in msg]
 
-            user_message = {"role": "user", "content": prompt}
-            all_messages = messages + cleaned_history + [user_message]
+            all_messages = messages + cleaned_history + [{"role": "user", "content": prompt}]
 
             response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
             for chunk in response:
@@ -284,7 +284,7 @@ async def ask_ollama_stream(user_id, chat_id, prompt, reply_to_message_id=None):
                 if delta:
                     reply_text += delta
 
-            # Сохраняем в историю группы с user_id
+            # Сохраняем историю группы
             await update_history(chat_id, user_id, "user", prompt, "group", max_len=GROUP_LIMIT)
             await update_history(chat_id, user_id, "assistant", reply_text.strip(), "group", max_len=GROUP_LIMIT)
 
@@ -293,6 +293,7 @@ async def ask_ollama_stream(user_id, chat_id, prompt, reply_to_message_id=None):
         print(f"Ollama error: {e}")
 
     return reply_text, reply_to_message_id
+
 
 
 
