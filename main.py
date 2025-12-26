@@ -6,11 +6,13 @@ from ollama import Client
 import asyncpg
 import os
 from collections import deque
+import base64
 
 # === НАСТРОЙКИ ===
 API_TOKEN = os.environ.get("BOT_TOKEN")
 MODEL = "gemma3:27b-cloud"
-CONTEXT_LIMIT = 1000
+PERSONAL_LIMIT = 30
+GROUP_LIMIT = 50
 DATABASE_URL = os.environ.get("DATABASE_URL")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
 
@@ -51,6 +53,10 @@ def is_nick(user_id: int) -> bool:
 def is_danilium(user_id: int) -> bool:
     return user_id == DANILIUM_ID
 
+def image_to_base64(path: str) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
 def get_system_prompt(user_id: int) -> str:
     if is_nick(user_id):
         return load_prompt(NICK_PROMPT_FILE)
@@ -58,6 +64,13 @@ def get_system_prompt(user_id: int) -> str:
         return load_prompt(DAN_PROMPT_FILE)
     else:
         return load_prompt(COMMON_PROMPT_FILE)
+
+def get_limit(context_type: str) -> int:
+    if context_type == "personal":
+        return PERSONAL_LIMIT
+    if context_type == "group":
+        return GROUP_LIMIT
+    return 20
 
 # === Работа с контекстом через БД ===
 async def init_db():
@@ -75,52 +88,102 @@ async def init_db():
         """)
 
 async def get_context(chat_id, user_id, context_type):
+    limit = get_limit(context_type)
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT messages FROM contexts WHERE chat_id=$1 AND user_id=$2 AND context_type=$3",
             chat_id, user_id, context_type
         )
         if row:
-            context = deque(json.loads(row["messages"]), maxlen=CONTEXT_LIMIT)
-            return context
-        return deque(maxlen=CONTEXT_LIMIT)
+            data = json.loads(row["messages"])
+            return deque(data, maxlen=limit)
+        return deque(maxlen=limit)
 
 async def save_context(chat_id, user_id, context_type, context):
-    if len(context) > CONTEXT_LIMIT:
-        context = deque(list(context)[-CONTEXT_LIMIT:], maxlen=CONTEXT_LIMIT)
+    limit = get_limit(context_type)
+    if len(context) > limit:
+        context = deque(list(context)[-limit:], maxlen=limit)
+
     async with db_pool.acquire() as conn:
-        data = json.dumps(list(context))
         await conn.execute("""
             INSERT INTO contexts(chat_id, user_id, context_type, messages)
             VALUES($1, $2, $3, $4)
-            ON CONFLICT(chat_id, user_id, context_type) DO UPDATE
-            SET messages = $4
-        """, chat_id, user_id, context_type, data)
+            ON CONFLICT(chat_id, user_id, context_type)
+            DO UPDATE SET messages = EXCLUDED.messages
+        """, chat_id, user_id, context_type, json.dumps(list(context)))
+
 
 # === Функции общения с Ollama ===
 async def ask_ollama_stream(user_id, chat_id, prompt):
-    personal = await get_context(chat_id, user_id, "personal")
-    group = await get_context(chat_id, 0, "group")
+    is_private = chat_id == user_id
+
     system_prompt = get_system_prompt(user_id)
 
-    personal.append({"role": "user", "content": prompt})
-    group.append({"role": "user", "user_id": user_id, "content": prompt})
+    messages = [{"role": "system", "content": system_prompt}]
 
-    messages = [{"role": "system", "content": system_prompt}] + list(group) + list(personal)
+    if is_private:
+        personal = await get_context(chat_id, user_id, "personal")
+        personal.append({"role": "user", "content": prompt})
+        messages += list(personal)
+        reply_text = ""
+        response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
+        for chunk in response:
+            delta = getattr(chunk.message, "content", "")
+            if delta:
+                reply_text += delta
+        personal.append({"role": "assistant", "content": reply_text.strip()})
+        await save_context(chat_id, user_id, "personal", personal)
+    elif not is_private:
+        group = await get_context(chat_id, 0, "group")
+        group.append({"role": "user", "user_id": user_id, "content": prompt})
+        messages += list(group)
+        reply_text = ""
+        response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
+        for chunk in response:
+            delta = getattr(chunk.message, "content", "")
+            if delta:
+                reply_text += delta
+        group.append({"role": "user", "content": f"[user:{user_id}] {prompt}"})
+        await save_context(chat_id, 0, "group", group)
+    else:
+        reply_text = "Ошибка определения типа чата. Как вы попали сюда?"    
+    return reply_text
 
-    reply_text = ""
-    response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
-    for chunk in response:
-        delta = getattr(chunk.message, "content", "")
-        if delta:
-            reply_text += delta
+async def ask_ollama_image_stream(user_id, chat_id, prompt, image_path):
+    is_private = chat_id == user_id
 
-    personal.append({"role": "assistant", "content": reply_text.strip()})
-    group.append({"role": "assistant", "user_id": user_id, "content": reply_text.strip()})
+    system_prompt = get_system_prompt(user_id)
+    image_b64 = image_to_base64(image_path)
+    image_content = f"<image>{image_b64}</image>"
 
-    await save_context(chat_id, user_id, "personal", personal)
-    await save_context(chat_id, 0, "group", group)
+    messages = [{"role": "system", "content": system_prompt}]
 
+    if is_private:
+        personal = await get_context(chat_id, user_id, "personal")
+        personal.append({"role": "user", "content": f"{image_content}\n{prompt}"})
+        messages += list(personal)
+        reply_text = ""
+        response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
+        for chunk in response:
+            delta = getattr(chunk.message, "content", "")
+            if delta:
+                reply_text += delta
+        personal.append({"role": "assistant", "content": reply_text.strip()})
+        await save_context(chat_id, user_id, "personal", personal)
+    elif not is_private:
+        group = await get_context(chat_id, 0, "group")
+        group.append({"role": "user", "user_id": user_id, "content": f"{image_content}\n{prompt}"})
+        messages += list(group)
+        reply_text = ""
+        response = ollama_client.chat(model=MODEL, messages=messages, stream=True)
+        for chunk in response:
+            delta = getattr(chunk.message, "content", "")
+            if delta:
+                reply_text += delta
+        group.append({"role": "user", "content": f"[user:{user_id}] {image_content}\n{prompt}"})
+        await save_context(chat_id, 0, "group", group)
+    else:
+        reply_text = "Ошибка определения типа чата. Как вы попали сюда?"    
     return reply_text
 
 # === Хэндлеры ===
@@ -149,12 +212,14 @@ async def handle_photo(message: types.Message):
     chat_id = message.chat.id
 
     photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         tmp_path = tmp.name
     try:
-        await bot.download(photo, destination=tmp_path)
+        await bot.download(file.file_path, destination=tmp_path)
         prompt = message.caption or "Опиши изображение кратко и по делу."
-        full_text = await ask_ollama_stream(user_id, chat_id, prompt)
+        image = image_to_base64(tmp_path)
+        full_text = await ask_ollama_image_stream(user_id, chat_id, prompt, image)
         await message.reply(full_text)
     finally:
         try:
@@ -169,5 +234,5 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    print("Бот запущен. Персональные и групповые контексты сохраняются в PostgreSQL.")
+    print("Бот запущен. Дай боже не ебнется.")
     asyncio.run(main())
