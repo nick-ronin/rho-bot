@@ -130,9 +130,10 @@ async def process_group_queue(chat_id):
             try:
                 reply_text, _ = await ask_ollama_text(user_id, chat_id, prompt, message_id)
                 if reply_text:
-                    await bot.send_message(chat_id, reply_text, reply_parameters=types.ReplyParameters(message_id=message_id))
+                    await bot.send_message(chat_id, reply_text, 
+                                         reply_parameters=types.ReplyParameters(message_id=message_id))
             except Exception as e:
-                print(f"Error processing group text {chat_id}: {e}")
+                print(f"Error processing group text {chat_id} for user {user_id}: {e}")
             finally:
                 queue.task_done()
 
@@ -148,11 +149,12 @@ async def process_group_image_queue(chat_id):
                 user_id, prompt, message_id, image_path = await queue.get()
                 full_text = await ask_ollama_image(user_id, chat_id, prompt, image_path)
                 if full_text:
-                    await bot.send_message(chat_id, full_text, reply_parameters=types.ReplyParameters(message_id=message_id))
+                    await bot.send_message(chat_id, full_text, 
+                                         reply_parameters=types.ReplyParameters(message_id=message_id))
                 if os.path.exists(image_path):
                     os.remove(image_path)
             except Exception as e:
-                print(f"Error processing group image {chat_id}: {e}")
+                print(f"Error processing group image {chat_id} for user {user_id}: {e}")
             finally:
                 queue.task_done()
 
@@ -243,170 +245,62 @@ async def ask_ollama_text(user_id, chat_id, prompt, reply_to_message_id=None):
     is_private = chat_id == user_id
     reply_text = ""
     
-    # 1. Загружаем историю
-    history = await get_context(chat_id, user_id if is_private else 0, 
-                               "personal" if is_private else "group")
-    
-    # 2. ОЧИСТКА: удаляем мусор из истории
-    cleaned_history = deque(maxlen=history.maxlen)
-    for msg in list(history):
-        content = msg.get('content', '')
-        # Удаляем "image received", "group user message" и другие мусорные сообщения
-        if content in ["image received", "group user message", "image received", ""]:
-            continue
-        # Удаляем дублированные assistant сообщения (следующие друг за другом)
-        if cleaned_history and cleaned_history[-1]['role'] == 'assistant' and msg['role'] == 'assistant':
-            print(f"WARNING: Skipping duplicate assistant message: {content[:50]}")
-            continue
-        cleaned_history.append(msg)
-    
-    # 3. Формируем system prompt
-    system_prompt = BASE_SYSTEM_PROMPT
-    user_instruction = get_user_instruction(user_id)
-    if user_instruction:
-        system_prompt += f"\n\n--- ИНСТРУКЦИЯ ДЛЯ ПОЛЬЗОВАТЕЛЯ {user_id} ---\n{user_instruction}\n--- КОНЕЦ ИНСТРУКЦИИ ---"
-    
-    messages = [{"role": "system", "content": system_prompt}]
-    
-    # 4. Добавляем ОЧИЩЕННУЮ историю
-    all_messages = messages + list(cleaned_history)
-    
-    # 6. Добавляем текущий запрос
-    all_messages.append({"role": "user", "content": prompt})
-    
-    # 7. ДЕБАГ-ВЫВОД
-    print(f"\n=== CLEAN HISTORY ===")
-    for i, msg in enumerate(list(cleaned_history)):
-        role = msg['role']
-        content = msg.get('content', 'NO CONTENT')
-        print(f"{i:2}. [{role:10}]: {content[:80]}{'...' if len(content) > 80 else ''}")
-    
-    print(f"\n=== FINAL REQUEST TO OLLAMA ===")
-    for i, msg in enumerate(all_messages):
-        role = msg['role']
-        content = msg.get('content', 'NO CONTENT')
-        if role == 'system':
-            content_preview = content[:100] + "..." if len(content) > 100 else content
-        else:
-            content_preview = content[:80] + "..." if len(content) > 80 else content
-        print(f"{i:2}. [{role:10}]: {content_preview}")
-    
-    try:
-        # 8. Отправляем запрос
-        response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
-        
-        collected_response = ""
-        for chunk in response:
-            delta = getattr(chunk.message, "content", "")
-            if delta:
-                collected_response += delta
-                reply_text += delta
-        
-        # 9. ПРОВЕРКА: не сохраняем пустые или мусорные ответы
-        if not collected_response.strip():
-            print("WARNING: Empty response from Ollama!")
-            reply_text = "Не получилось сформулировать ответ. Попробуй ещё раз."
-        else:
-            # 10. Сохраняем ТОЛЬКО если всё ок
-            cleaned_history.append({"role": "user", "content": prompt})
-            cleaned_history.append({"role": "assistant", "content": collected_response.strip()})
-            
-            # Ещё одна проверка на дубли
-            if len(list(cleaned_history)) >= 2:
-                last_two = list(cleaned_history)[-2:]
-                if last_two[0]['role'] == 'assistant' and last_two[1]['role'] == 'assistant':
-                    print("CRITICAL: Detected double assistant in cleaned history! Removing last one.")
-                    cleaned_history.pop()
-            
-            await save_context(chat_id, user_id if is_private else 0, 
-                              "personal" if is_private else "group", cleaned_history)
-            
-    except Exception as e:
-        reply_text = "Сейчас бот не отвечает, попробуй позже."
-        print(f"Ollama text error: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Если 500 - сбросим контекст для этого чата
-        if "500" in str(e) or "Internal Server Error" in str(e):
-            print(f"Resetting context for chat {chat_id}, user {user_id if is_private else 0}")
-            await save_context(chat_id, user_id if is_private else 0, 
-                              "personal" if is_private else "group", deque(maxlen=history.maxlen))
-
-    return reply_text, reply_to_message_id
-
-# === Изображения (с base64) ===
-async def ask_ollama_image(user_id, chat_id, prompt, image_path):
-    reply_text = ""
-    
-    # 1. Загружаем историю
-    history = await get_context(chat_id, user_id if chat_id == user_id else 0,
-                                "personal" if chat_id == user_id else "group")
-    
-    # 2. ОЧИСТКА: УДАЛЯЕМ ПРЕДЫДУЩИЕ ЗАПРОСЫ НА ОПИСАНИЕ КАРТИНОК
-    cleaned_history = deque(maxlen=history.maxlen)
-    for msg in list(history):
-        content = msg.get('content', '')
-        role = msg.get('role', '')
-        
-        # Пропускаем пустые
-        if not content or content.strip() == "":
-            continue
-            
-        # Пропускаем мусор
-        if content in ["image received", "group user message"]:
-            continue
-            
-        # КРИТИЧНО: пропускаем предыдущие запросы на описание картинок
-        if "опиши изображение" in content.lower() or "что на изображении" in content.lower():
-            print(f"Skipping previous image description request: {content[:50]}...")
-            # Но сохраняем ответ на него, если он есть
-            continue
-            
-        cleaned_history.append(msg)
-    
-    # 3. System prompt с нормальной личностью
+    # System prompt с УЧЕТОМ пользователя даже в группе
     system_prompt = BASE_SYSTEM_PROMPT
     user_instruction = get_user_instruction(user_id)
     if user_instruction:
         system_prompt += f"\n\n{user_instruction}"
     
-    max_history_messages = 2
-    recent_history = []
-    for msg in reversed(list(cleaned_history)):
-        recent_history.insert(0, msg)
-        if len(recent_history) >= max_history_messages:
-            break
-    
-    # 5. Формируем запрос
     messages = [{"role": "system", "content": system_prompt}]
-    all_messages = messages + recent_history
-    
-    # 7. Добавляем запрос с картинкой
-    user_message = {"role": "user", "content": prompt, "images": [image_path]}
-    all_messages.append(user_message)
-    
-    # 8. ДЕБАГ
-    print(f"\n=== IMAGE REQUEST (PERSONALITY MODE) ===")
-    print(f"System prompt length: {len(system_prompt)}")
-    print(f"Recent history: {len(recent_history)} messages")
-    print(f"Total messages: {len(all_messages)}")
-    
-    for i, msg in enumerate(all_messages):
-        role = msg['role']
-        if 'images' in msg:
-            img_preview = msg.get('content', '')[:40]
-            print(f"{i}. [{role}]: [IMAGE] '{img_preview}...'")
-        elif role == 'system':
-            preview = system_prompt[:100].replace('\n', ' ')
-            print(f"{i}. [{role}]: {preview}...")
-        else:
-            content = msg.get('content', '')[:60]
-            print(f"{i}. [{role}]: {content}...")
     
     try:
-        # 9. Отправляем запрос с историей
-        print(f"\nSending to {MODEL}...")
+        # КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: В группе тоже сохраняем по user_id, а не 0!
+        if is_private:
+            # Личка: контекст per пользователь
+            history_user_id = user_id
+            context_type = "personal"
+        else:
+            # Группа: контекст per пользователь в этом чате
+            history_user_id = user_id  # НЕ 0!
+            context_type = "group"
+        
+        history = await get_context(chat_id, history_user_id, context_type)
+        
+        # Очистка истории
+        cleaned_history = deque(maxlen=history.maxlen)
+        for msg in list(history):
+            content = msg.get('content', '')
+            role = msg.get('role', '')
+            
+            if not content or content.strip() == "":
+                continue
+            if content in ["image received", "group user message", "continue", "продолжай"]:
+                continue
+                
+            # Проверяем последовательность
+            if cleaned_history and cleaned_history[-1]['role'] == role:
+                print(f"Skipping duplicate {role} message")
+                continue
+                
+            cleaned_history.append(msg)
+        
+        # Добавляем историю
+        all_messages = messages + list(cleaned_history)
+        
+        # Если последнее сообщение - assistant, добавляем continuation
+        if all_messages and all_messages[-1]['role'] == 'assistant':
+            print(f"Adding continuation for user {user_id} in {'private' if is_private else 'group'}")
+            all_messages.append({"role": "user", "content": "продолжай"})
+        
+        # Добавляем текущий запрос
+        all_messages.append({"role": "user", "content": prompt})
+        
+        # ДЕБАГ
+        print(f"\n=== TEXT REQUEST ===")
+        print(f"User: {user_id} ({'you' if is_nick(user_id) else 'other'})")
+        print(f"Chat: {'private' if is_private else 'group'} {chat_id}")
+        print(f"Messages: {len(all_messages)}, History: {len(cleaned_history)}")
+        
         response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
         
         collected_response = ""
@@ -417,26 +311,112 @@ async def ask_ollama_image(user_id, chat_id, prompt, image_path):
                 reply_text += delta
         
         if collected_response.strip():
-            print(f"Response length: {len(collected_response)} chars")
-            print(f"Response preview: {collected_response[:150]}...")
+            # Сохраняем с правильным user_id
+            cleaned_history.append({"role": "user", "content": prompt})
+            cleaned_history.append({"role": "assistant", "content": collected_response.strip()})
             
-            # 10. Сохраняем в историю, НО не сохраняем "Опиши изображение" если это дефолтный промпт
-            save_prompt = prompt
-            save_response = collected_response.strip()
+            await save_context(chat_id, history_user_id, context_type, cleaned_history)
             
-            # Если это дефолтный промпт, сохраняем как "прислал изображение"
-            if prompt.lower() in ["опиши изображение кратко и по делу.", "опиши изображение", "что на изображении"]:
-                save_prompt = "прислал изображение"
+            # Логируем
+            print(f"Saved context for user {history_user_id} in {context_type}")
+        else:
+            reply_text = "Не получилось сформулировать ответ."
+            
+    except Exception as e:
+        reply_text = "Сейчас бот не отвечает, попробуй позже."
+        print(f"Ollama text error: {e}")
+        
+        # При 500 сбрасываем контекст для ЭТОГО пользователя
+        if "500" in str(e):
+            print(f"Resetting context for user {history_user_id} in chat {chat_id}")
+            await save_context(chat_id, history_user_id, context_type, deque(maxlen=history.maxlen))
+
+    return reply_text, reply_to_message_id
+
+# === Изображения (с base64) ===
+async def ask_ollama_image(user_id, chat_id, prompt, image_path):
+    reply_text = ""
+    
+    # System prompt с учетом пользователя
+    system_prompt = BASE_SYSTEM_PROMPT
+    user_instruction = get_user_instruction(user_id)
+    if user_instruction:
+        system_prompt += f"\n\n{user_instruction}"
+    
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    try:
+        # Аналогично: в группе раздельный контекст
+        if chat_id == user_id:
+            # Личка
+            history_user_id = user_id
+            context_type = "personal"
+        else:
+            # Группа
+            history_user_id = user_id  # НЕ 0!
+            context_type = "group"
+        
+        history = await get_context(chat_id, history_user_id, context_type)
+        
+        # Очистка истории (пропускаем старые запросы на описание картинок)
+        cleaned_history = deque(maxlen=history.maxlen)
+        for msg in list(history):
+            content = msg.get('content', '')
+            role = msg.get('role', '')
+            
+            if not content or content.strip() == "":
+                continue
+            if content in ["image received", "group user message"]:
+                continue
+            if "опиши изображение" in content.lower():
+                continue
+                
+            cleaned_history.append(msg)
+        
+        # Берём последние 2 сообщения
+        max_history_messages = 2
+        recent_history = list(cleaned_history)[-max_history_messages:]
+        
+        all_messages = messages + recent_history
+        
+        # Проверяем последовательность
+        if all_messages and all_messages[-1]['role'] == 'assistant':
+            print(f"Image: Adding continuation for user {user_id}")
+            all_messages.append({"role": "user", "content": "продолжай"})
+        
+        # Добавляем запрос с картинкой
+        user_message = {"role": "user", "content": prompt, "images": [image_path]}
+        all_messages.append(user_message)
+        
+        # ДЕБАГ
+        print(f"\n=== IMAGE REQUEST ===")
+        print(f"User: {user_id} ({'you' if is_nick(user_id) else 'other'})")
+        print(f"Context: {context_type}")
+        print(f"Recent history: {len(recent_history)} messages")
+        
+        response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
+        
+        collected_response = ""
+        for chunk in response:
+            delta = getattr(chunk.message, "content", "")
+            if delta:
+                collected_response += delta
+                reply_text += delta
+        
+        if collected_response.strip():
+            # Сохраняем (но не дефолтные промпты "опиши изображение")
+            save_prompt = "прислал изображение" if "опиши изображение" in prompt.lower() else prompt
             
             cleaned_history.append({"role": "user", "content": save_prompt})
-            cleaned_history.append({"role": "assistant", "content": save_response})
+            cleaned_history.append({"role": "assistant", "content": collected_response.strip()})
             
-            limit = PERSONAL_LIMIT if chat_id == user_id else GROUP_LIMIT
+            limit = PERSONAL_LIMIT if context_type == "personal" else GROUP_LIMIT
             if len(cleaned_history) > limit:
                 cleaned_history = deque(list(cleaned_history)[-limit:], maxlen=limit)
             
-            await save_context(chat_id, user_id if chat_id == user_id else 0,
-                               "personal" if chat_id == user_id else "group", cleaned_history)
+            await save_context(chat_id, history_user_id, context_type, cleaned_history)
+            
+            print(f"Saved image context for user {history_user_id}")
         else:
             reply_text = "Не получилось описать изображение."
             
@@ -444,19 +424,10 @@ async def ask_ollama_image(user_id, chat_id, prompt, image_path):
         reply_text = "Сейчас бот не отвечает, попробуй позже."
         print(f"Ollama image error: {e}")
         
-        # Альтернативный подход: без истории
-        try:
-            print("\n=== FALLBACK: Simple image request ===")
-            simple_messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt, "images": [image_path]}
-            ]
-            response = ollama_client.chat(model=MODEL, messages=simple_messages, stream=False)
-            if response and hasattr(response, 'message'):
-                reply_text = response.message.content
-                print("Fallback worked!")
-        except Exception as e2:
-            print(f"Fallback also failed: {e2}")
+        # Сброс контекста для этого пользователя
+        if "500" in str(e):
+            print(f"Resetting image context for user {history_user_id}")
+            await save_context(chat_id, history_user_id, context_type, deque(maxlen=history.maxlen))
 
     return reply_text
 
