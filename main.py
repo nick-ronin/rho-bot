@@ -12,7 +12,6 @@ import io
 import base64
 
 # === НАСТРОЙКИ ===
-load_dotenv()
 
 API_TOKEN = os.environ.get("BOT_TOKEN")
 MODEL = "gemma3:27b-cloud"
