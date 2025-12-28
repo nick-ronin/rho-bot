@@ -379,11 +379,6 @@ async def ask_ollama_image(user_id, chat_id, prompt, image_path):
         
         all_messages = messages + recent_history
         
-        # Проверяем последовательность
-        if all_messages and all_messages[-1]['role'] == 'assistant':
-            print(f"Image: Adding continuation for user {user_id}")
-            all_messages.append({"role": "user", "content": "продолжай"})
-        
         # Добавляем запрос с картинкой
         user_message = {"role": "user", "content": prompt, "images": [image_path]}
         all_messages.append(user_message)
