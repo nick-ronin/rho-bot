@@ -15,7 +15,7 @@ import base64
 API_TOKEN = os.environ.get("BOT_TOKEN")
 MODEL = "gemma3:27b-cloud"
 PERSONAL_LIMIT = 30
-GROUP_LIMIT = 50
+GROUP_LIMIT = 30
 DATABASE_URL = os.environ.get("DATABASE_URL")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
 
@@ -52,19 +52,20 @@ def load_prompt(file_path: str) -> str:
     with open(file_path, encoding="utf-8") as f:
         return f.read().strip()
 
+BASE_SYSTEM_PROMPT = load_prompt(COMMON_PROMPT_FILE)
+
 def is_nick(user_id: int) -> bool:
     return user_id in [NICK_ID, CHANNEL_COMMENTS_NICK_ID, CHANNEL_NICK_ID]
 
 def is_danilium(user_id: int) -> bool:
     return user_id == DANILIUM_ID
 
-def get_system_prompt(user_id: int) -> str:
+def get_user_instruction(user_id: int) -> str | None:
     if is_nick(user_id):
         return load_prompt(NICK_PROMPT_FILE)
     elif is_danilium(user_id):
         return load_prompt(DAN_PROMPT_FILE)
-    else:
-        return load_prompt(COMMON_PROMPT_FILE)
+    return None
 
 def resize_image(image_path, max_size=(512, 512), quality=85):
     try:
@@ -194,9 +195,11 @@ async def save_context(chat_id, user_id, context_type, context):
 # === Текстовые сообщения ===
 async def ask_ollama_text(user_id, chat_id, prompt, reply_to_message_id=None):
     is_private = chat_id == user_id
-    system_prompt = get_system_prompt(user_id)
+    user_instruction = get_user_instruction(user_id)
     reply_text = ""
-    messages = [{"role": "system", "content": system_prompt}]
+    messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
+    if user_instruction:
+        messages.append({"role": "assistant", "content": user_instruction})
 
     try:
         history = await get_context(chat_id, user_id if is_private else 0, "personal" if is_private else "group")
@@ -207,7 +210,6 @@ async def ask_ollama_text(user_id, chat_id, prompt, reply_to_message_id=None):
             if delta:
                 reply_text += delta
 
-        history.append({"role": "user", "content": prompt if is_private else "group user message"})
         history.append({"role": "assistant", "content": reply_text.strip()})
         await save_context(chat_id, user_id if is_private else 0, "personal" if is_private else "group", history)
 
@@ -219,9 +221,11 @@ async def ask_ollama_text(user_id, chat_id, prompt, reply_to_message_id=None):
 
 # === Изображения (с base64) ===
 async def ask_ollama_image(user_id, chat_id, prompt, image_path):
-    system_prompt = get_system_prompt(user_id)
+    user_instruction = get_user_instruction(user_id)
     reply_text = ""
-    messages = [{"role": "system", "content": system_prompt}]
+    messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
+    if user_instruction:
+        messages.append({"role": "assistant", "content": user_instruction})
     max_history_messages = 2
 
     try:
@@ -238,8 +242,6 @@ async def ask_ollama_image(user_id, chat_id, prompt, image_path):
             delta = getattr(chunk.message, "content", "")
             if delta:
                 reply_text += delta
-
-        history.append({"role": "user", "content": "image received"})
         history.append({"role": "assistant", "content": reply_text.strip()})
         limit = PERSONAL_LIMIT if chat_id == user_id else GROUP_LIMIT
         if len(history) > limit:
