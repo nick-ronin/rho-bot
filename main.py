@@ -199,7 +199,7 @@ async def ask_ollama_text(user_id, chat_id, prompt, reply_to_message_id=None):
     reply_text = ""
     messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
     if user_instruction:
-        messages.append({"role": "assistant", "content": user_instruction})
+        messages.append({"role": "system", "content": user_instruction})
 
     try:
         history = await get_context(chat_id, user_id if is_private else 0, "personal" if is_private else "group")
@@ -225,7 +225,7 @@ async def ask_ollama_image(user_id, chat_id, prompt, image_path):
     reply_text = ""
     messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
     if user_instruction:
-        messages.append({"role": "assistant", "content": user_instruction})
+        messages.append({"role": "system", "content": user_instruction})
     max_history_messages = 2
 
     try:
