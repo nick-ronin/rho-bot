@@ -286,10 +286,6 @@ async def ask_ollama_text(user_id, chat_id, prompt, reply_to_message_id=None):
         # Добавляем историю
         all_messages = messages + list(cleaned_history)
         
-        # Если последнее сообщение - assistant, добавляем continuation
-        if all_messages and all_messages[-1]['role'] == 'assistant':
-            print(f"Adding continuation for user {user_id} in {'private' if is_private else 'group'}")
-            all_messages.append({"role": "user", "content": "продолжай"})
         
         # Добавляем текущий запрос
         all_messages.append({"role": "user", "content": prompt})
