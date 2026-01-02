@@ -12,6 +12,8 @@ from ollama import Client
 from dotenv import load_dotenv
 from PIL import Image
 
+from asyncpg.types import Json
+
 # ================== ENV ==================
 
 load_dotenv()
@@ -143,7 +145,7 @@ async def load_context(chat_id: int, user_id: int, ctx_type: str) -> Deque:
         limit = context_limit(ctx_type)
         if not row:
             return deque(maxlen=limit)
-        return deque(row["messages"], maxlen=limit)
+        return deque(Json(row["messages"]), maxlen=limit)
 
 async def save_context(chat_id: int, user_id: int, ctx_type: str, ctx: Deque):
     async with db_pool.acquire() as conn:
@@ -151,7 +153,7 @@ async def save_context(chat_id: int, user_id: int, ctx_type: str, ctx: Deque):
         INSERT INTO contexts VALUES ($1,$2,$3,$4)
         ON CONFLICT (chat_id,user_id,context_type)
         DO UPDATE SET messages=$4, updated_at=now()
-        """, chat_id, user_id, ctx_type, list(ctx))
+        """, chat_id, user_id, ctx_type, Json(list(ctx)))  
 
 # ================== MESSAGE BUILD ==================
 
