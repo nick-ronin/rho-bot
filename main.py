@@ -143,7 +143,7 @@ async def load_context(chat_id: int, user_id: int, ctx_type: str) -> Deque:
         limit = context_limit(ctx_type)
         if not row:
             return deque(maxlen=limit)
-        return deque(json.loads(row["messages"]), maxlen=limit)
+        return deque(row["messages"], maxlen=limit)
 
 async def save_context(chat_id: int, user_id: int, ctx_type: str, ctx: Deque):
     async with db_pool.acquire() as conn:
