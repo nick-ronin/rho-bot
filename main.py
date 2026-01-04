@@ -18,7 +18,7 @@ load_dotenv()
 API_TOKEN = os.environ.get("BOT_TOKEN")
 MODEL = "gemma3:27b-cloud"
 PERSONAL_LIMIT = 30
-GROUP_LIMIT = 30
+GROUP_LIMIT = 20
 DATABASE_URL = os.environ.get("DATABASE_URL")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
 
