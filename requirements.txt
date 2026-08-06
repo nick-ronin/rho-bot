@@ -1,0 +1,5 @@
+aiogram==3.23.0
+aiosqlite==0.22.1
+ollama==0.6.1
+pillow==12.0.0
+python-dotenv==1.2.1
