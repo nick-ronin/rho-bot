@@ -16,7 +16,7 @@ load_dotenv()
 # === НАСТРОЙКИ ===
 
 API_TOKEN = os.environ.get("BOT_TOKEN")
-MODEL = "kimi-k3.1-pro:cloud"
+MODEL = "glm-5.2"
 PERSONAL_LIMIT = 20
 GROUP_LIMIT = 15
 DATABASE_URL = os.environ.get("DATABASE_URL") or "data/bot.db"
