@@ -1,9 +1,15 @@
 import asyncio
+import base64
 import tempfile
 import json
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import math
+import random
+import time
 from aiogram import Bot, Dispatcher, types, F
-from ollama import Client
+from aiogram.filters import Command
+import aiohttp
 import aiosqlite
 import os
 from collections import deque
@@ -16,12 +22,32 @@ load_dotenv()
 # === НАСТРОЙКИ ===
 
 API_TOKEN = os.environ.get("BOT_TOKEN")
-MODEL = "glm-5.2"
 PERSONAL_LIMIT = 20
 GROUP_LIMIT = 15
+IMAGE_HISTORY_MESSAGES = 2
 DATABASE_URL = os.environ.get("DATABASE_URL") or "data/bot.db"
-OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
 DEBUG_UPDATES = os.environ.get("DEBUG_UPDATES", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+# --- OpenRouter ---
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
+# Запасные модели через запятую: если основная лежит/лимитится, OpenRouter сам пробует следующую
+FALLBACK_MODELS = [m.strip() for m in os.environ.get("OPENROUTER_FALLBACK_MODELS", "").split(",") if m.strip()]
+# Ризонинг жрёт токены и время. Для болталки в телеге обычно не нужен.
+REASONING_ENABLED = os.environ.get("OPENROUTER_REASONING", "0").strip().lower() in {"1", "true", "yes", "on"}
+MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "1500"))
+_temp = os.environ.get("LLM_TEMPERATURE", "").strip()
+TEMPERATURE = float(_temp) if _temp else None
+# Число попыток для сетевых ошибок/5xx. После 429 повторов нет.
+LLM_RETRIES = max(1, int(os.environ.get("LLM_RETRIES", "2")))
+# Общие ограничения для ВСЕХ чатов и фотографий в одном процессе бота.
+LLM_MIN_INTERVAL = max(6.0, float(os.environ.get("LLM_MIN_INTERVAL", "6")))
+LLM_QUEUE_TIMEOUT = max(1.0, float(os.environ.get("LLM_QUEUE_TIMEOUT", "30")))
+LLM_RATE_LIMIT_PAUSE = max(30.0, float(os.environ.get("LLM_RATE_LIMIT_PAUSE", "60")))
+
+TG_MESSAGE_LIMIT = 4000  # у Telegram жёсткий лимит 4096, оставляем запас
+
 
 def normalize_id(raw_id: int | str | None) -> int | None:
     """
@@ -78,7 +104,6 @@ DANILIUM_ID = parse_required_int_env("DANILIUM_ID")
 ALICE_ID = parse_required_int_env("ALICE_ID")
 
 # === Маппинг каналов для группировки контекстов (из .env) ===
-# Читаем ID каналов и комментариев из переменных окружения
 def parse_channel_id(env_var: str) -> int:
     """Читает ID из .env и нормализует к внутреннему формату."""
     cid_str = os.environ.get(env_var, "0").strip()
@@ -112,23 +137,20 @@ if not API_TOKEN:
     raise RuntimeError("Telegram BOT_TOKEN not set")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
-if not OLLAMA_API_KEY:
-    raise RuntimeError("OLLAMA_API_KEY not set")
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY not set")
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 db = None
+http_session: aiohttp.ClientSession | None = None
 
 db_path = os.path.abspath(DATABASE_URL)
 db_dir = os.path.dirname(db_path)
 os.makedirs(db_dir, exist_ok=True)
 
-ollama_client = Client(
-    host="https://ollama.com", 
-    headers={'Authorization': f'Bearer {OLLAMA_API_KEY}'}
-)
-
 # Логируем конфиг при запуске
+print(f"[CONFIG] MODEL: {MODEL} (fallbacks: {FALLBACK_MODELS or 'нет'}, reasoning: {REASONING_ENABLED})")
 print(f"[CONFIG] NICK_ID: {NICK_ID}")
 print(f"[CONFIG] NICK_CHANNEL_IDS: {NICK_CHANNEL_IDS} (нормализованные ID)")
 print(f"[CONFIG] DANILIUM_ID: {DANILIUM_ID}")
@@ -204,7 +226,7 @@ def has_bot_mention(message: types.Message) -> bool:
 def should_respond_in_chat(message: types.Message) -> bool:
     """
     Определяет, должен ли бот отвечать на это сообщение.
-    
+
     Логика:
     - ЛС: всегда отвечаем
     - Исходные каналы: НИКОГДА не отвечаем
@@ -219,15 +241,15 @@ def should_respond_in_chat(message: types.Message) -> bool:
 
     chat_id = normalize_id(message.chat.id)
     is_private = message.chat.type == "private"
-    
+
     # Личные сообщения - всегда отвечаем
     if is_private:
         return True
-    
+
     # В исходных каналах вообще не отвечаем
     if chat_id in CHANNEL_IDS:
         return False
-    
+
     # В группах комментариев
     if chat_id in COMMENTS_GROUP_IDS:
         if message.sender_chat:
@@ -237,7 +259,7 @@ def should_respond_in_chat(message: types.Message) -> bool:
                 return True
         # Любые остальные сообщения в комментариях -> только reply/mention
         return is_reply_to_bot(message) or has_bot_mention(message)
-    
+
     # В других чатах не отвечаем
     return False
 
@@ -257,7 +279,7 @@ def get_user_instruction(user_id: int) -> str | None:
         return ALICE_PROMPT_CONTENT
     else:
         return BASE_USER_PROMPT_CONTENT
-    
+
 def get_full_system_prompt(user_id: int) -> str:
     prompt = BASE_SYSTEM_PROMPT
     user_instruction = get_user_instruction(user_id)
@@ -297,6 +319,29 @@ def get_limit(context_type: str) -> int:
 def resolve_context_type(is_private: bool) -> str:
     return "personal" if is_private else "group"
 
+# === Отправка сообщений (с разбивкой под лимит Telegram) ===
+def split_text(text: str, limit: int = TG_MESSAGE_LIMIT) -> list[str]:
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    if text:
+        chunks.append(text)
+    return chunks
+
+async def send_reply(api_chat_id, text: str, reply_to_message_id: int | None = None):
+    """Шлёт ответ, режет длинные тексты на части. Реплай только на первую часть."""
+    for i, chunk in enumerate(split_text(text or "...")):
+        reply_params = None
+        if i == 0 and reply_to_message_id:
+            reply_params = types.ReplyParameters(message_id=reply_to_message_id)
+        await bot.send_message(api_chat_id, chunk, reply_parameters=reply_params)
+
 # === Очереди ===
 group_text_queues = {}
 group_text_locks = {}
@@ -317,10 +362,9 @@ async def process_group_queue(api_chat_id):
         while not queue.empty():
             user_id, context_chat_id, prompt, message_id = await queue.get()
             try:
-                reply_text, _ = await ask_ollama_text(user_id, context_chat_id, prompt, message_id, is_private=False)
+                reply_text = await ask_llm(user_id, context_chat_id, prompt, is_private=False)
                 if reply_text:
-                    await bot.send_message(api_chat_id, reply_text,
-                                         reply_parameters=types.ReplyParameters(message_id=message_id))
+                    await send_reply(api_chat_id, reply_text, message_id)
             except Exception as e:
                 print(f"Error processing group text api_chat={api_chat_id} ctx_chat={context_chat_id} for user {user_id}: {e}")
             finally:
@@ -334,30 +378,19 @@ async def process_group_image_queue(api_chat_id):
 
     async with lock:
         while not queue.empty():
+            user_id, context_chat_id, prompt, message_id, image_data = await queue.get()
+            image_paths = image_data if isinstance(image_data, list) else [image_data]
             try:
-                user_id, context_chat_id, prompt, message_id, image_data = await queue.get()
-                
-                # Проверяем, одно ли это изображение или несколько
-                if isinstance(image_data, list):
-                    # Несколько изображений
-                    full_text = await ask_ollama_multiple_images(user_id, context_chat_id, prompt, image_data, is_private=False)
-                    image_paths = image_data
-                else:
-                    # Одно изображение
-                    full_text = await ask_ollama_image(user_id, context_chat_id, prompt, image_data, is_private=False)
-                    image_paths = [image_data]
-                
+                full_text = await ask_llm_images(user_id, context_chat_id, prompt, image_paths, is_private=False)
                 if full_text:
-                    await bot.send_message(api_chat_id, full_text,
-                                         reply_parameters=types.ReplyParameters(message_id=message_id))
-                
-                # Удаляем все временные файлы
-                for path in image_paths:
-                    if os.path.exists(path):
-                        os.remove(path)
+                    await send_reply(api_chat_id, full_text, message_id)
             except Exception as e:
                 print(f"Error processing group image api_chat={api_chat_id} ctx_chat={context_chat_id} for user {user_id}: {e}")
             finally:
+                # Удаляем все временные файлы
+                for path in image_paths:
+                    try: os.remove(path)
+                    except Exception: pass
                 queue.task_done()
 
 # === Работа с контекстом через БД ===
@@ -421,6 +454,13 @@ async def save_context(chat_id, user_id, context_type, context):
 
     await db.commit()
 
+async def reset_context(chat_id, user_id, context_type):
+    await db.execute(
+        "DELETE FROM contexts WHERE chat_id=? AND user_id=? AND context_type=?",
+        (chat_id, user_id, context_type),
+    )
+    await db.commit()
+
 async def cleanup_all_contexts():
     """Очищает все контексты от мусорных сообщений"""
 
@@ -476,263 +516,257 @@ async def cleanup_all_contexts():
 
     await db.commit()
 
-# === Текстовые сообщения ===
-async def ask_ollama_text(user_id, chat_id, prompt, reply_to_message_id=None, is_private=False):
-    reply_text = ""
-    
-    # System prompt с учетом индивидуальной инструкции пользователя
-    system_prompt = get_full_system_prompt(user_id)
-    
-    messages = [{"role": "system", "content": system_prompt}]
-    history_user_id = user_id
+# === OpenRouter ===
+class LLMError(Exception):
+    def __init__(self, status: int, body: str = ""):
+        super().__init__(f"OpenRouter error {status}: {body[:300]}")
+        self.status = status
+        self.body = body
+
+
+# 429 обрабатываем отдельно: останавливаем запросы, а не повторяем их подряд.
+RETRYABLE_STATUSES = {500, 502, 503, 504}
+llm_request_lock = asyncio.Lock()
+llm_next_request_at = 0.0
+llm_cooldown_until = 0.0
+llm_rate_limit_streak = 0
+
+
+def parse_retry_after(value: str | None) -> float:
+    """Retry-After: секунды либо HTTP-дата. Некорректный заголовок игнорируем."""
+    if not value:
+        return 0.0
+    try:
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else 0.0
+    except ValueError:
+        try:
+            until = parsedate_to_datetime(value)
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=timezone.utc)
+            return max(0.0, (until - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+
+
+def check_llm_cooldown() -> None:
+    remaining = llm_cooldown_until - time.monotonic()
+    if remaining > 0:
+        raise LLMError(429, f"Общая пауза после лимита: ещё {math.ceil(remaining)} сек.")
+
+
+async def call_llm(messages: list[dict]) -> str:
+    """Общая очередь API: один запрос за раз, интервал и пауза после 429."""
+    global llm_next_request_at, llm_cooldown_until, llm_rate_limit_streak
+    check_llm_cooldown()
+    # Не накапливаем бесконечную очередь при большом потоке сообщений.
+    try:
+        await asyncio.wait_for(llm_request_lock.acquire(), timeout=LLM_QUEUE_TIMEOUT)
+    except asyncio.TimeoutError as exc:
+        raise LLMError(0, "Очередь запросов занята. Попробуй немного позже.") from exc
+
+    try:
+        check_llm_cooldown()  # Пока ждали очередь, другой запрос мог получить 429.
+        return await _call_llm_locked(messages)
+    finally:
+        llm_request_lock.release()
+
+
+async def _call_llm_locked(messages: list[dict]) -> str:
+    global llm_next_request_at, llm_cooldown_until, llm_rate_limit_streak
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "max_tokens": MAX_TOKENS,
+    }
+    if FALLBACK_MODELS:
+        payload["models"] = list(dict.fromkeys([MODEL, *FALLBACK_MODELS]))
+    if TEMPERATURE is not None:
+        payload["temperature"] = TEMPERATURE
+    if REASONING_ENABLED:
+        payload["reasoning"] = {"enabled": True}
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "X-Title": BOT_USERNAME,
+    }
+
+    last_error = LLMError(0, "Запрос не выполнен")
+    for attempt in range(LLM_RETRIES):
+        check_llm_cooldown()
+        delay = llm_next_request_at - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        # Считаем каждую попытку, включая неудачные запросы и повторы.
+        llm_next_request_at = time.monotonic() + LLM_MIN_INTERVAL
+        retry_after = 0.0
+        try:
+            async with http_session.post(OPENROUTER_URL, json=payload, headers=headers) as resp:
+                raw = await resp.text()
+                status = resp.status
+                retry_after = parse_retry_after(resp.headers.get("Retry-After"))
+
+            if status == 200:
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, dict) and data.get("error"):
+                        err = data["error"]
+                        code = err.get("code", 500) if isinstance(err, dict) else 500
+                        raise LLMError(int(code) if str(code).isdigit() else 500,
+                                       json.dumps(err, ensure_ascii=False))
+                    message = data["choices"][0]["message"]
+                    content = (message.get("content") or "").strip()
+                except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+                    raise LLMError(502, "Некорректный ответ OpenRouter") from exc
+                llm_rate_limit_streak = 0
+                return content
+
+            last_error = LLMError(status, raw)
+        except LLMError as exc:
+            last_error = exc
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            last_error = LLMError(0, f"network: {exc}")
+
+        if last_error.status == 429:
+            # Учитываем Retry-After даже на последней попытке и на HTTP 200 + error.
+            llm_rate_limit_streak += 1
+            backoff = min(900.0, LLM_RATE_LIMIT_PAUSE * 2 ** min(llm_rate_limit_streak - 1, 5))
+            pause = max(retry_after, backoff) + random.uniform(0, 3)
+            llm_cooldown_until = time.monotonic() + pause
+            print(f"[LLM] Получен 429. Общая пауза {math.ceil(pause)} сек.; без немедленного повтора.")
+            raise last_error
+
+        retryable = last_error.status in RETRYABLE_STATUSES or last_error.status == 0
+        if retryable:
+            delay = max(retry_after, 5.0 * 2 ** attempt) + random.uniform(0, 2)
+            # Отложенный запуск сохраняется и после исчерпания попыток.
+            llm_next_request_at = max(llm_next_request_at, time.monotonic() + delay)
+            if attempt < LLM_RETRIES - 1:
+                # Очень долгий Retry-After не держит очередь; бот попросит повторить позже.
+                if delay > LLM_QUEUE_TIMEOUT:
+                    llm_cooldown_until = max(llm_cooldown_until, llm_next_request_at)
+                    break
+                print(f"[LLM] {last_error}; retry in {math.ceil(delay)}s ({attempt + 1}/{LLM_RETRIES})")
+                continue
+            if retry_after > 0:
+                llm_cooldown_until = max(llm_cooldown_until, llm_next_request_at)
+        break
+
+    raise last_error
+
+
+def image_to_data_url(path: str) -> str:
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def build_user_content(prompt: str, image_paths: list[str] | None):
+    """Для текста — строка, для картинок — OpenAI-формат с image_url (base64 data URL)."""
+    if not image_paths:
+        return prompt
+    parts = [{"type": "text", "text": prompt}]
+    for path in image_paths:
+        parts.append({"type": "image_url", "image_url": {"url": image_to_data_url(path)}})
+    return parts
+
+
+JUNK_CONTENT = {"image received", "group user message", "continue", "продолжай"}
+IMAGE_DEFAULT_PROMPT_MARK = "посмотри на изображение и опиши свою реакцию на него."
+
+
+def clean_history(history) -> deque:
+    cleaned = deque(maxlen=history.maxlen)
+    for msg in history:
+        content = msg.get("content") or ""
+        role = msg.get("role", "")
+
+        if not content.strip() or content in JUNK_CONTENT:
+            continue
+        if IMAGE_DEFAULT_PROMPT_MARK in content.lower():
+            continue
+        if cleaned and cleaned[-1]["role"] == role:
+            print(f"Skipping duplicate {role} message")
+            continue
+
+        cleaned.append(msg)
+    return cleaned
+
+
+# === Единая функция запроса к LLM (текст и картинки) ===
+async def ask_llm(user_id, chat_id, prompt, *, image_paths=None, save_prompt=None, is_private=False) -> str:
+    has_images = bool(image_paths)
     context_type = resolve_context_type(is_private)
-    history = deque(maxlen=get_limit(context_type))
-    
+    history_user_id = user_id
+    save_prompt = save_prompt or prompt
+    reply_text = ""
+
     try:
         history = await get_context(chat_id, history_user_id, context_type)
-        
-        # Очистка истории
-        cleaned_history = deque(maxlen=history.maxlen)
-        for msg in list(history):
-            content = msg.get('content', '')
-            role = msg.get('role', '')
-            
-            if not content or content.strip() == "":
-                continue
-            if content in ["image received", "group user message", "continue", "продолжай"]:
-                continue
-                
-            # Проверяем последовательность
-            if cleaned_history and cleaned_history[-1]['role'] == role:
-                print(f"Skipping duplicate {role} message")
-                continue
-                
-            cleaned_history.append(msg)
-        
-        # Добавляем историю
-        all_messages = messages + list(cleaned_history)
-        
-        
-        # Добавляем текущий запрос
-        all_messages.append({"role": "user", "content": prompt})
-        
-        # ДЕБАГ
+        cleaned_history = clean_history(history)
+
+        recent = list(cleaned_history)
+        if has_images:
+            recent = recent[-IMAGE_HISTORY_MESSAGES:]
+        # Некоторые шаблоны чата не любят, когда после system сразу идёт assistant
+        while recent and recent[0]["role"] != "user":
+            recent.pop(0)
+
+        messages = [{"role": "system", "content": get_full_system_prompt(user_id)}]
+        messages += [{"role": m["role"], "content": m["content"]} for m in recent]
+        messages.append({"role": "user", "content": build_user_content(prompt, image_paths)})
+
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n[{timestamp}] === TEXT REQUEST ===")
-        print(f"User: {user_id} ({'you' if is_nick(user_id) else 'other'})")
-        print(f"Chat: {'private' if is_private else 'group'} {chat_id}")
-        print(f"Messages: {len(all_messages)}, History: {len(cleaned_history)}")
-        
-        response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
-        
-        collected_response = ""
-        for chunk in response:
-            delta = getattr(chunk.message, "content", "")
-            if delta:
-                collected_response += delta
-                reply_text += delta
-        
-        if collected_response.strip():
-            # Сохраняем с правильным user_id
-            cleaned_history.append({"role": "user", "content": prompt})
-            cleaned_history.append({"role": "assistant", "content": collected_response.strip()})
-            
+        kind = f"IMAGES x{len(image_paths)}" if has_images else "TEXT"
+        print(f"\n[{timestamp}] === {kind} REQUEST === user={user_id} ({'you' if is_nick(user_id) else 'other'}) "
+              f"chat={chat_id} ({context_type}) messages={len(messages)} history={len(recent)}")
+
+        reply_text = await call_llm(messages)
+
+        if reply_text:
+            cleaned_history.append({"role": "user", "content": save_prompt})
+            cleaned_history.append({"role": "assistant", "content": reply_text})
             await save_context(chat_id, history_user_id, context_type, cleaned_history)
-            
-            # Логируем
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{timestamp}] Saved context for user {history_user_id} in {context_type}")
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Saved context for user {history_user_id} in {context_type}")
         else:
-            reply_text = "Не получилось сформулировать ответ."
-            
-    except Exception as e:
-        reply_text = "Сейчас бот не отвечает, попробуй позже."
-        print(f"Ollama text error: {e}")
-        
-        # При 500 сбрасываем контекст для ЭТОГО пользователя
-        if "500" in str(e):
+            reply_text = "Не получилось описать изображение." if has_images else "Не получилось сформулировать ответ."
+
+    except LLMError as e:
+        print(f"LLM error: {e}")
+        if e.status == 429:
+            remaining = max(1, math.ceil(llm_cooldown_until - time.monotonic()))
+            reply_text = (f"Сервис временно ограничил запросы. Бот сделал паузу. "
+                          f"Попробуй ещё раз примерно через {remaining} сек. "
+                          "Если исчерпан суточный лимит, потребуется дождаться его сброса.")
+        else:
+            reply_text = "Сейчас бот не отвечает, попробуй позже."
+        # 400 обычно значит, что контекст/запрос кривой — сбрасываем историю.
+        # На 429/5xx контекст трогать не нужно: он тут ни при чём.
+        if e.status == 400:
             print(f"Resetting context for user {history_user_id} in chat {chat_id}")
-            await save_context(chat_id, history_user_id, context_type, deque(maxlen=history.maxlen))
-
-    return reply_text, reply_to_message_id
-
-# === Изображения (с base64) ===
-async def ask_ollama_image(user_id, chat_id, prompt, image_path, is_private=False):
-    reply_text = ""
-    
-    # System prompt с учетом пользователя
-    system_prompt = get_full_system_prompt(user_id)
-    
-    messages = [{"role": "system", "content": system_prompt}]
-    history_user_id = user_id
-    context_type = resolve_context_type(is_private)
-    history = deque(maxlen=get_limit(context_type))
-    
-    try:
-        history = await get_context(chat_id, history_user_id, context_type)
-        
-        # Очистка истории (пропускаем старые запросы на описание картинок)
-        cleaned_history = deque(maxlen=history.maxlen)
-        for msg in list(history):
-            content = msg.get('content', '')
-            role = msg.get('role', '')
-            
-            if not content or content.strip() == "":
-                continue
-            if content in ["image received", "group user message"]:
-                continue
-            if "посмотри на изображение и опиши свою реакцию на него." in content.lower():
-                continue
-                
-            cleaned_history.append(msg)
-        
-        # Берём последние 2 сообщения
-        max_history_messages = 2
-        recent_history = list(cleaned_history)[-max_history_messages:]
-        
-        all_messages = messages + recent_history
-        
-        # Добавляем запрос с картинкой
-        user_message = {"role": "user", "content": prompt, "images": [image_path]}
-        all_messages.append(user_message)
-        
-        # ДЕБАГ
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n[{timestamp}] === IMAGE REQUEST ===")
-        print(f"User: {user_id} ({'you' if is_nick(user_id) else 'other'})")
-        print(f"Context: {context_type}")
-        print(f"Recent history: {len(recent_history)} messages")
-        
-        response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
-        
-        collected_response = ""
-        for chunk in response:
-            delta = getattr(chunk.message, "content", "")
-            if delta:
-                collected_response += delta
-                reply_text += delta
-        
-        if collected_response.strip():
-            # Сохраняем (но не дефолтные промпты "опиши изображение")
-            save_prompt = "прислал изображение" if "опиши изображение" in prompt.lower() else prompt
-            
-            cleaned_history.append({"role": "user", "content": save_prompt})
-            cleaned_history.append({"role": "assistant", "content": collected_response.strip()})
-            
-            limit = PERSONAL_LIMIT if context_type == "personal" else GROUP_LIMIT
-            if len(cleaned_history) > limit:
-                cleaned_history = deque(list(cleaned_history)[-limit:], maxlen=limit)
-            
-            await save_context(chat_id, history_user_id, context_type, cleaned_history)
-            
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{timestamp}] Saved image context for user {history_user_id}")
-        else:
-            reply_text = "Не получилось описать изображение."
-            
+            await save_context(chat_id, history_user_id, context_type, deque(maxlen=get_limit(context_type)))
     except Exception as e:
         reply_text = "Сейчас бот не отвечает, попробуй позже."
-        print(f"Ollama image error: {e}")
-        
-        # Сброс контекста для этого пользователя
-        if "500" in str(e):
-            print(f"Resetting image context for user {history_user_id}")
-            await save_context(chat_id, history_user_id, context_type, deque(maxlen=history.maxlen))
+        print(f"LLM unexpected error: {e}")
 
     return reply_text
 
 
-# === Множественные изображения ===
-async def ask_ollama_multiple_images(user_id, chat_id, prompt, image_paths: list, is_private=False):
-    """
-    Обрабатывает несколько изображений в одном сообщении.
-    Отправляет все изображения LLM и получает синтезированный ответ.
-    """
-    reply_text = ""
-    
-    # System prompt с учетом пользователя
-    system_prompt = get_full_system_prompt(user_id)
-    
-    messages = [{"role": "system", "content": system_prompt}]
-    history_user_id = user_id
-    context_type = resolve_context_type(is_private)
-    
-    try:
-        history = await get_context(chat_id, history_user_id, context_type)
-        
-        # Очистка истории
-        cleaned_history = deque(maxlen=history.maxlen)
-        for msg in list(history):
-            content = msg.get('content', '')
-            role = msg.get('role', '')
-            
-            if not content or content.strip() == "":
-                continue
-            if content in ["image received", "group user message"]:
-                continue
-            if "посмотри на изображение и опиши свою реакцию на него." in content.lower():
-                continue
-                
-            cleaned_history.append(msg)
-        
-        # Берём последние 2 сообщения
-        max_history_messages = 2
-        recent_history = list(cleaned_history)[-max_history_messages:]
-        
-        all_messages = messages + recent_history
-        
-        # Подготавливаем промпт для нескольких изображений
-        num_images = len(image_paths)
-        multi_prompt = f"Ты видишь {num_images} изображений. {prompt}\n\nПожалуйста, рассмотри все изображения и дай общий синтезированный ответ."
-        
-        # Добавляем запрос со всеми картинками
-        user_message = {"role": "user", "content": multi_prompt, "images": image_paths}
-        all_messages.append(user_message)
-        
-        # ДЕБАГ
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n[{timestamp}] === MULTIPLE IMAGES REQUEST ===")
-        print(f"User: {user_id} ({'you' if is_nick(user_id) else 'other'})")
-        print(f"Context: {context_type}")
-        print(f"Images: {num_images}, Recent history: {len(recent_history)} messages")
-        
-        response = ollama_client.chat(model=MODEL, messages=all_messages, stream=True)
-        
-        collected_response = ""
-        for chunk in response:
-            delta = getattr(chunk.message, "content", "")
-            if delta:
-                collected_response += delta
-                reply_text += delta
-        
-        if collected_response.strip():
-            # Сохраняем в контекст
-            save_prompt = f"прислал {num_images} изображения"
-            
-            cleaned_history.append({"role": "user", "content": save_prompt})
-            cleaned_history.append({"role": "assistant", "content": collected_response.strip()})
-            
-            limit = PERSONAL_LIMIT if context_type == "personal" else GROUP_LIMIT
-            if len(cleaned_history) > limit:
-                cleaned_history = deque(list(cleaned_history)[-limit:], maxlen=limit)
-            
-            await save_context(chat_id, history_user_id, context_type, cleaned_history)
-            
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{timestamp}] Saved {num_images} images context for user {history_user_id}")
-        else:
-            reply_text = "Не получилось описать изображения."
-            
-    except Exception as e:
-        reply_text = "Сейчас бот не отвечает, попробуй позже."
-        print(f"Ollama multiple images error: {e}")
-        
-        # Сброс контекста для этого пользователя
-        if "500" in str(e):
-            print(f"Resetting context for user {history_user_id}")
-            await save_context(chat_id, history_user_id, context_type, deque(maxlen=history.maxlen))
+async def ask_llm_images(user_id, chat_id, prompt, image_paths: list, is_private=False) -> str:
+    """Одна или несколько картинок в одном запросе."""
+    num_images = len(image_paths)
+    if num_images > 1:
+        llm_prompt = (f"Ты видишь {num_images} изображений. {prompt}\n\n"
+                      "Пожалуйста, рассмотри все изображения и дай общий синтезированный ответ.")
+        save_prompt = f"прислал {num_images} изображения"
+    else:
+        llm_prompt = prompt
+        # Дефолтные промпты "опиши изображение" в историю не пишем
+        save_prompt = "прислал изображение" if "опиши изображение" in prompt.lower() else prompt
 
-    return reply_text
+    return await ask_llm(user_id, chat_id, llm_prompt, image_paths=image_paths,
+                         save_prompt=save_prompt, is_private=is_private)
 
 
 # === Обработка групп фотографий (media_group) ===
@@ -742,10 +776,10 @@ async def process_media_group_after_delay(media_group_id: str):
     затем обрабатывает их как группу.
     """
     await asyncio.sleep(0.5)
-    
+
     if media_group_id not in media_group_buffers:
         return
-    
+
     buffer = media_group_buffers[media_group_id]
     sender_id = buffer["sender_id"]
     context_chat_id = buffer["context_chat_id"]
@@ -754,20 +788,21 @@ async def process_media_group_after_delay(media_group_id: str):
     message_id = buffer["message_id"]
     prompt = buffer["prompt"]
     photo_file_ids = buffer["photos"]
-    
+
     resized_paths = []
     tmp_paths = []
-    
+    queued = False
+
     try:
         # Скачиваем и обрабатываем все фото
         for file_id in photo_file_ids:
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                 tmp_path = tmp.name
             tmp_paths.append(tmp_path)
-            
+
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as resized_tmp:
                 resized_path = resized_tmp.name
-            
+
             await bot.download(file_id, destination=tmp_path)
             buffer_img = resize_image(tmp_path)
             if not buffer_img:
@@ -777,53 +812,65 @@ async def process_media_group_after_delay(media_group_id: str):
                 except Exception:
                     pass
                 continue
-            
+
             with open(resized_path, 'wb') as f:
                 f.write(buffer_img.getvalue())
             resized_paths.append(resized_path)
-        
+
         if not resized_paths:
-            msg_text = "Не удалось обработать одно или несколько изображений."
-            if is_private:
-                await bot.send_message(api_chat_id, msg_text)
-            else:
-                await bot.send_message(api_chat_id, msg_text, reply_parameters=types.ReplyParameters(message_id=message_id))
+            await send_reply(api_chat_id, "Не удалось обработать одно или несколько изображений.",
+                             None if is_private else message_id)
             return
-        
+
         await bot.send_chat_action(api_chat_id, "typing")
-        
+
         # Обработка фото
         if is_private:
-            full_text = await ask_ollama_multiple_images(sender_id, context_chat_id, prompt, resized_paths, is_private=True)
-            await bot.send_message(api_chat_id, full_text)
+            full_text = await ask_llm_images(sender_id, context_chat_id, prompt, resized_paths, is_private=True)
+            await send_reply(api_chat_id, full_text)
         else:
             if api_chat_id not in group_image_queues:
                 group_image_queues[api_chat_id] = asyncio.Queue()
                 group_image_locks[api_chat_id] = asyncio.Lock()
             await group_image_queues[api_chat_id].put((sender_id, context_chat_id, prompt, message_id, resized_paths))
+            queued = True  # файлы удалит сама очередь
             asyncio.create_task(process_group_image_queue(api_chat_id))
-    
+
     except Exception as e:
         print(f"Error processing media group {media_group_id}: {e}")
-    
+
     finally:
-        # Очищаем все временные файлы
+        # Очищаем временные файлы
         for path in tmp_paths:
             try: os.remove(path)
             except Exception: pass
-        if is_private:
+        if not queued:
             for path in resized_paths:
                 try: os.remove(path)
                 except Exception: pass
-        
+
         # Удаляем из буферов
-        if media_group_id in media_group_buffers:
-            del media_group_buffers[media_group_id]
-        if media_group_id in media_group_timers:
-            del media_group_timers[media_group_id]
+        media_group_buffers.pop(media_group_id, None)
+        media_group_timers.pop(media_group_id, None)
 
 
 # === Хэндлеры ===
+@dp.message(Command("reset"))
+async def handle_reset(message: types.Message):
+    """Сбрасывает контекст диалога (в ЛС и в группах комментариев)."""
+    sender_id = extract_sender_id(message)
+    chat_id = normalize_id(message.chat.id)
+    if not sender_id or chat_id is None:
+        return
+
+    is_private = message.chat.type == "private"
+    if not is_private and chat_id not in COMMENTS_GROUP_IDS:
+        return
+
+    await reset_context(chat_id, get_context_user_id(sender_id), resolve_context_type(is_private))
+    await message.reply("Контекст сброшен. Начинаем с чистого листа.")
+
+
 @dp.message(F.text)
 async def handle_msg(message: types.Message):
     sender_id = extract_sender_id(message)
@@ -835,8 +882,7 @@ async def handle_msg(message: types.Message):
     if context_chat_id is None:
         return
     is_private = message.chat.type == "private"
-    
-    # Используем новую логику для определения, отвечать ли
+
     if not should_respond_in_chat(message):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{timestamp}] [SKIP] sender_id={sender_id}, chat_id={context_chat_id}, ignored")
@@ -846,8 +892,9 @@ async def handle_msg(message: types.Message):
     context_user_id = get_context_user_id(sender_id)
 
     if is_private:
-        full_text, _ = await ask_ollama_text(context_user_id, context_chat_id, message.text, message.message_id, is_private=True)
-        await message.reply(full_text)
+        await bot.send_chat_action(api_chat_id, "typing")
+        full_text = await ask_llm(context_user_id, context_chat_id, message.text, is_private=True)
+        await send_reply(api_chat_id, full_text, message.message_id)
     else:
         if api_chat_id not in group_text_queues:
             group_text_queues[api_chat_id] = asyncio.Queue()
@@ -866,28 +913,26 @@ async def handle_photo(message: types.Message):
     if context_chat_id is None:
         return
     is_private = message.chat.type == "private"
-    
-    # Используем новую логику для определения, отвечать ли
+
     if not should_respond_in_chat(message):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{timestamp}] [SKIP] sender_id={sender_id}, chat_id={context_chat_id}, photo ignored")
         return
-    
+
     # Получаем фокусный ID для группировки контекста
     context_user_id = get_context_user_id(sender_id)
 
     prompt = message.caption or "Опиши изображение кратко и по делу."
     photo = message.photo[-1]
-    
+
     # Проверяем, является ли это частью альбома (media_group_id)
     if message.media_group_id:
-        # Это часть группы фотографий
         media_group_id = message.media_group_id
-        
+
         # Отменяем старый таймер если он был
         if media_group_id in media_group_timers:
             media_group_timers[media_group_id].cancel()
-        
+
         # Инициализируем буфер если это первое фото из группы
         if media_group_id not in media_group_buffers:
             media_group_buffers[media_group_id] = {
@@ -899,49 +944,51 @@ async def handle_photo(message: types.Message):
                 "message_id": message.message_id,
                 "prompt": prompt
             }
-        
+
         # Добавляем фото в буфер
         media_group_buffers[media_group_id]["photos"].append(photo.file_id)
-        
+
         # Планируем обработку группы после задержки
         task = asyncio.create_task(process_media_group_after_delay(media_group_id))
         media_group_timers[media_group_id] = task
-        
+
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{timestamp}] Media group {media_group_id}: added photo, total: {len(media_group_buffers[media_group_id]['photos'])}")
         return
-    
+
     # Это одиночное фото (не альбом)
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         tmp_path = tmp.name
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as resized_tmp:
         resized_path = resized_tmp.name
 
+    queued = False
     try:
         await bot.download(photo.file_id, destination=tmp_path)
         buffer = resize_image(tmp_path)
         if not buffer:
-            await message.reply("Не удалось обработать изображение.") if is_private else await bot.send_message(api_chat_id, "Не удалось обработать изображение.", reply_parameters=types.ReplyParameters(message_id=message.message_id))
+            await send_reply(api_chat_id, "Не удалось обработать изображение.", message.message_id)
             return
 
         with open(resized_path, 'wb') as f:
             f.write(buffer.getvalue())
-        
-        await message.bot.send_chat_action(api_chat_id, "typing")
+
+        await bot.send_chat_action(api_chat_id, "typing")
 
         if is_private:
-            full_text = await ask_ollama_image(context_user_id, context_chat_id, prompt, resized_path, is_private=True)
-            await message.reply(full_text)
+            full_text = await ask_llm_images(context_user_id, context_chat_id, prompt, [resized_path], is_private=True)
+            await send_reply(api_chat_id, full_text, message.message_id)
         else:
             if api_chat_id not in group_image_queues:
                 group_image_queues[api_chat_id] = asyncio.Queue()
                 group_image_locks[api_chat_id] = asyncio.Lock()
             await group_image_queues[api_chat_id].put((context_user_id, context_chat_id, prompt, message.message_id, resized_path))
+            queued = True  # файл удалит сама очередь
             asyncio.create_task(process_group_image_queue(api_chat_id))
     finally:
         try: os.remove(tmp_path)
         except Exception: pass
-        if is_private:
+        if not queued:
             try: os.remove(resized_path)
             except Exception: pass
 
@@ -958,7 +1005,7 @@ async def debug_all_messages(message: types.Message):
     sender_id = extract_sender_id(message)
     chat_id = normalize_id(message.chat.id)
     chat_type = message.chat.type
-    
+
     # Определяем тип сообщения
     msg_type = "unknown"
     if message.text:
@@ -969,7 +1016,7 @@ async def debug_all_messages(message: types.Message):
         msg_type = "video"
     elif message.document:
         msg_type = "document"
-    
+
     # Логируем всё подробно
     log_msg = f"[DEBUG] Message from sender_id={sender_id}, chat_id={chat_id}, type={chat_type}, msg_type={msg_type}"
     if message.sender_chat:
@@ -978,11 +1025,13 @@ async def debug_all_messages(message: types.Message):
         log_msg += f", media_group_id={message.media_group_id}"
     if message.text:
         log_msg += f", text='{message.text[:50]}...'"
-    
+
     print(log_msg)
 
 # === Старт бота ===
 async def main():
+    global http_session
+    http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
     await bot.delete_webhook(drop_pending_updates=True)
     await init_db()
     await cleanup_all_contexts()
@@ -991,6 +1040,7 @@ async def main():
     finally:
         if db:
             await db.close()
+        await http_session.close()
         await bot.session.close()
 
 if __name__ == "__main__":
