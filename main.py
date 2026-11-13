@@ -29,9 +29,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL") or "data/bot.db"
 DEBUG_UPDATES = os.environ.get("DEBUG_UPDATES", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # --- OpenRouter ---
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
+AITUNNEL_API_KEY = os.environ.get("AITUNNEL_API_KEY")
+OPENROUTER_URL = "https://api.aitunnel.ru/v1/chat/completions"
+MODEL = os.environ.get("AITUNNEL_MODEL")
 # Запасные модели через запятую: если основная лежит/лимитится, OpenRouter сам пробует следующую
 FALLBACK_MODELS = [m.strip() for m in os.environ.get("OPENROUTER_FALLBACK_MODELS", "").split(",") if m.strip()]
 # Ризонинг жрёт токены и время. Для болталки в телеге обычно не нужен.
@@ -137,8 +137,8 @@ if not API_TOKEN:
     raise RuntimeError("Telegram BOT_TOKEN not set")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
-if not OPENROUTER_API_KEY:
-    raise RuntimeError("OPENROUTER_API_KEY not set")
+if not AITUNNEL_API_KEY:
+    raise RuntimeError("AITUNNEL_API_KEY not set")
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
@@ -587,7 +587,7 @@ async def _call_llm_locked(messages: list[dict]) -> str:
         payload["reasoning"] = {"enabled": True}
 
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {AITUNNEL_API_KEY}",
         "Content-Type": "application/json",
         "X-Title": BOT_USERNAME,
     }
@@ -673,7 +673,7 @@ def build_user_content(prompt: str, image_paths: list[str] | None):
 
 
 JUNK_CONTENT = {"image received", "group user message", "continue", "продолжай"}
-IMAGE_DEFAULT_PROMPT_MARK = "посмотри на изображение и опиши свою реакцию на него."
+IMAGE_DEFAULT_PROMPT_MARK = "посмотри на изображение и отреагируй на него."
 
 
 def clean_history(history) -> deque:
@@ -922,7 +922,7 @@ async def handle_photo(message: types.Message):
     # Получаем фокусный ID для группировки контекста
     context_user_id = get_context_user_id(sender_id)
 
-    prompt = message.caption or "Опиши изображение кратко и по делу."
+    prompt = message.caption or "Посмотри на изображение и отреагируй на него."
     photo = message.photo[-1]
 
     # Проверяем, является ли это частью альбома (media_group_id)
